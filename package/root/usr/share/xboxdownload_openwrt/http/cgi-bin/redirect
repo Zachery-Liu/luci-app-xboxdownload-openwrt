@@ -1,0 +1,39 @@
+#!/bin/sh
+
+case "$REQUEST_METHOD" in
+	GET|HEAD) ;;
+	*) printf 'Status: 405 Method Not Allowed\r\nAllow: GET, HEAD\r\n\r\n'; exit ;;
+esac
+
+host=$(printf '%s' "${HTTP_HOST%%:*}" | tr 'A-Z' 'a-z')
+case "$host" in
+	''|*[!a-z0-9.-]*) printf 'Status: 400 Bad Request\r\n\r\n'; exit ;;
+esac
+case "$REQUEST_URI" in
+	/*) ;;
+	*) printf 'Status: 400 Bad Request\r\n\r\n'; exit ;;
+esac
+if printf '%s' "$REQUEST_URI" | LC_ALL=C grep -q '[[:cntrl:]]'; then
+	printf 'Status: 400 Bad Request\r\n\r\n'
+	exit
+fi
+target=$(awk -v host="$host" '$1 == host { print $2; exit }' /usr/share/xboxdownload_openwrt/domains)
+if [ -z "$target" ]; then
+	printf 'Status: 404 Not Found\r\n\r\n'
+	exit
+fi
+
+log_mode=http
+log_path=0
+if [ -r /var/run/xboxdownload_openwrt/http-log ]; then
+	read -r log_mode log_path < /var/run/xboxdownload_openwrt/http-log
+fi
+if [ "$log_mode" != off ]; then
+	details="$host -> $target"
+	if [ "$log_path" = 1 ]; then
+		path=$(printf '%s' "${REQUEST_URI%%\?*}" | LC_ALL=C cut -c 1-160)
+		details="$details$path"
+	fi
+	logger -t xboxdownload_openwrt "HTTP 302 $REMOTE_ADDR $details"
+fi
+printf 'Status: 302 Found\r\nLocation: http://%s%s\r\nCache-Control: no-store\r\nContent-Length: 0\r\n\r\n' "$target" "$REQUEST_URI"

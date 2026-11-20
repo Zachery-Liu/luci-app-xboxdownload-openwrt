@@ -1,0 +1,197 @@
+#!/bin/sh /etc/rc.common
+
+START=95
+USE_PROCD=1
+
+. /lib/functions/network.sh
+. /usr/share/xboxdownload_openwrt/common.sh
+
+write_dns() {
+	local host target key addresses value
+	printf '%s\n' "port=$DNS_PORT" "listen-address=$lan_ip,127.0.0.1" \
+		"pid-file=$RUNDIR/dnsmasq.pid" 'no-resolv' 'cache-size=64' 'dns-forward-max=32'
+	if [ "$ipv6_dns" = 1 ]; then
+		printf '%s\n' "interface=$lan_dev" 'bind-dynamic'
+	else
+		printf '%s\n' 'bind-interfaces'
+	fi
+	if [ -n "$upstream" ]; then
+		printf 'servers-file=%s\n' "$UPSTREAM_FILE"
+	else
+		printf 'server=%s#53\n' "$lan_ip"
+	fi
+	printf 'host-record=%s,%s\n' "$HEALTH_HOST" "$lan_ip"
+	if [ "$log_mode" = all ]; then
+		printf '%s\n' 'log-queries=extra' 'log-facility=local5' 'log-async=8'
+	fi
+	[ "$filter_aaaa" != 1 ] || printf '%s\n' 'filter-AAAA'
+
+	while read -r host target; do
+		value=
+		case "$host:$target" in
+			*.xboxlive.com:*) value=$global_ip ;;
+			*:blzddist1-a.akamaihd.net) [ -n "$battle_ip" ] || continue ;;
+		esac
+		if [ -z "$value" ] && [ "${mode:-redirect}" = redirect ]; then
+			value=$HTTP_ADDRESS
+			printf 'local=/%s/\n' "$host"
+		elif [ "$ipv6_dns" = 1 ] && [ -n "$value" ] && ipv4 "$value"; then
+			printf 'local=/%s/\n' "$host"
+		fi
+		[ -z "$value" ] || printf 'host-record=%s,%s\n' "$host" "$value"
+	done < "$DATA/domains"
+
+	if [ "${mode:-redirect}" = redirect ] || [ -n "$global_ip" ]; then
+		for host in assets-srvs.xboxlive.com assets-srvs-net.trafficmanager.net \
+			assets-srvs-apac.delivery.microsoft.com assets-srvs-na.delivery.microsoft.com; do
+			printf 'srv-host=%s,assets1.xboxlive.com,80,0,0\n' "$host"
+		done
+	fi
+	while read -r key addresses; do
+		eval "value=\${$key}"
+		[ -n "$value" ] || continue
+		printf 'host-record=%s,%s\n' "$addresses" "$value"
+		if [ "$ipv6_dns" = 1 ] && ipv4 "$value"; then
+			printf 'local=/%s/\n' "$(printf '%s' "$addresses" | tr ',' '/')"
+		fi
+	done < "$DATA/cdn-hosts"
+}
+
+write_ipv6_dns_firewall() {
+	cat <<-EOF
+		table inet xboxdownload_openwrt_ipv6 {
+			chain dns6_request_zone {
+				type filter hook prerouting priority raw; policy accept;
+				iifname "$lan_dev" ether saddr $ipv6_block_mac meta nfproto ipv6 meta l4proto { tcp, udp } th dport 53 fib daddr . iif type local ct zone set $DNS_ZONE
+			}
+			chain dns6_reply_zone {
+				type filter hook output priority raw; policy accept;
+				oifname "$lan_dev" meta nfproto ipv6 meta l4proto { tcp, udp } th sport $DNS_PORT ct zone set $DNS_ZONE
+			}
+			chain select_xbox_ipv6_dns {
+				type nat hook prerouting priority -101; policy accept;
+				iifname "$lan_dev" ether saddr $ipv6_block_mac meta nfproto ipv6 meta l4proto { tcp, udp } th dport 53 fib daddr . iif type local counter redirect to :$DNS_PORT
+			}
+			chain restrict_dns6_port {
+				type filter hook input priority -1; policy accept;
+				iifname "$lan_dev" ether saddr $ipv6_block_mac meta nfproto ipv6 meta l4proto { tcp, udp } th dport $DNS_PORT ct status dnat accept
+				iifname != "lo" meta nfproto ipv6 meta l4proto { tcp, udp } th dport $DNS_PORT drop
+			}
+		}
+	EOF
+}
+
+write_firewall() {
+	local http_rule= tcp_ports=$DNS_PORT
+	if [ "${mode:-redirect}" = redirect ]; then
+		http_rule="iifname \"$lan_dev\" ip saddr { $client } ip daddr $HTTP_ADDRESS tcp dport 80 dnat to $lan_ip:$HTTP_PORT"
+		tcp_ports="$DNS_PORT, $HTTP_PORT"
+	fi
+	cat <<-EOF
+		destroy table ip xboxdownload_openwrt
+		destroy table inet xboxdownload_openwrt_ipv6
+		table ip xboxdownload_openwrt {
+			# Isolate DNS NAT so existing client tuples immediately fall back after stop.
+			chain dns_request_zone {
+				type filter hook prerouting priority raw; policy accept;
+				iifname "$lan_dev" ip saddr { $client } ip daddr $lan_ip meta l4proto { tcp, udp } th dport 53 ct zone set $DNS_ZONE
+			}
+			chain dns_reply_zone {
+				type filter hook output priority raw; policy accept;
+				ip saddr $lan_ip ip daddr { $client } meta l4proto { tcp, udp } th sport $DNS_PORT ct zone set $DNS_ZONE
+			}
+			chain select_xbox {
+				type nat hook prerouting priority -101; policy accept;
+				iifname "$lan_dev" ip saddr { $client } ip daddr $lan_ip udp dport 53 dnat to $lan_ip:$DNS_PORT
+				iifname "$lan_dev" ip saddr { $client } ip daddr $lan_ip tcp dport 53 dnat to $lan_ip:$DNS_PORT
+				$http_rule
+			}
+			chain restrict_ports {
+				type filter hook input priority -1; policy accept;
+				ip daddr $lan_ip udp dport $DNS_PORT ct status dnat iifname "$lan_dev" ip saddr { $client } accept
+				ip daddr $lan_ip tcp dport { $tcp_ports } ct status dnat iifname "$lan_dev" ip saddr { $client } accept
+				ip daddr $lan_ip udp dport $DNS_PORT drop
+				ip daddr $lan_ip tcp dport { $tcp_ports } drop
+			}
+		}
+	EOF
+	if [ "$ipv6_dns" = 1 ]; then
+		write_ipv6_dns_firewall
+		return
+	fi
+	[ "$ipv6_block" = 1 ] || return 0
+	cat <<-EOF
+		table inet xboxdownload_openwrt_ipv6 {
+			chain restrict_xbox_ipv6_dns {
+				type filter hook input priority -5; policy accept;
+				iifname "$lan_dev" ether saddr $ipv6_block_mac meta nfproto ipv6 meta l4proto { tcp, udp } th dport 53 counter reject with icmpv6 type admin-prohibited
+			}
+			chain restrict_xbox_ipv6_forward {
+				type filter hook forward priority -5; policy accept;
+				iifname "$lan_dev" ether saddr $ipv6_block_mac ip6 daddr 2000::/3 counter reject with icmpv6 type admin-prohibited
+			}
+		}
+	EOF
+}
+
+report_error() {
+	printf '%s\n' "$1" > "$RUNDIR/error"
+	logger -t xboxdownload_openwrt "$1"
+	return 1
+}
+
+start_service() {
+	local validation token dns_ipv6=
+	mkdir -p "$RUNDIR"
+	rm -f "$RUNDIR/error"
+	load_settings
+	[ "$enabled" = 1 ] || return 0
+
+	lan_network || { report_error 'LAN IPv4 unavailable'; return 1; }
+	validation=$(validate_settings) || { report_error "Invalid settings: $validation"; return 1; }
+	client=$(normalize_clients "$client")
+	if [ "$ipv6_dns" = 1 ]; then
+		dns_ipv6=$(ip -6 addr show dev "$lan_dev" scope link |
+			awk '/inet6/ && !/tentative|dadfailed/ { split($2, address, "/"); print address[1]; exit }')
+		[ -n "$dns_ipv6" ] || { report_error 'LAN IPv6 unavailable'; return 1; }
+		dns_ipv6="[$dns_ipv6%$lan_dev]:$DNS_PORT"
+	fi
+
+	if [ -n "$upstream" ]; then
+		write_upstream "$upstream" || { report_error 'Could not set DNS upstream'; return 1; }
+	fi
+	write_dns > "$RUNDIR/dnsmasq.conf"
+	/usr/sbin/dnsmasq --test -C "$RUNDIR/dnsmasq.conf" >/dev/null 2>&1 ||
+		{ report_error 'dnsmasq configuration failed'; return 1; }
+	write_firewall > "$RUNDIR/rules.nft"
+	nft -c -f "$RUNDIR/rules.nft" ||
+		{ report_error 'Invalid nftables rules'; return 1; }
+
+	printf '%s %s\n' "$log_mode" "$log_path" > "$RUNDIR/http-log"
+	token=$(cat /proc/sys/kernel/random/uuid) || return 1
+	lock "$SERVICE_LOCK" || return 1
+	rm -f "$RUNDIR/ready" "$UPSTREAM_STATE"
+	printf '%s\n' "$token" > "$RUNDIR/instance"
+	lock -u "$SERVICE_LOCK"
+	procd_open_instance service
+	procd_set_param command "$DATA/supervise" "$token" "$lan_ip" "$mode" "$upstream" "$dns_ipv6"
+	procd_set_param respawn 3600 1 5
+	procd_set_param term_timeout 3
+	procd_set_param stderr 1
+	procd_close_instance
+}
+
+stop_service() {
+	lock "$SERVICE_LOCK" || return 1
+	rm -f "$RUNDIR/instance" "$RUNDIR/ready" "$RUNDIR/error" "$UPSTREAM_STATE"
+	clear_rules
+	lock -u "$SERVICE_LOCK"
+}
+
+reload_service() {
+	restart
+}
+
+service_triggers() {
+	procd_add_reload_interface_trigger lan
+}

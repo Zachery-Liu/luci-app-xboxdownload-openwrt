@@ -1,0 +1,399 @@
+#!/bin/sh
+
+. /usr/share/libubox/jshn.sh
+. /lib/functions.sh
+. /lib/functions/network.sh
+. /usr/share/xboxdownload_openwrt/common.sh
+
+INIT=/etc/init.d/xboxdownload_openwrt
+
+result() {
+	json_init
+	json_add_string error "$1"
+	json_dump
+}
+
+read_logs() {
+	logread -l 256 2>/dev/null |
+		awk -v clients=",$client," '
+			/xboxdownload_openwrt: LOG RESET$/ { count = 0; next }
+			/xboxdownload_openwrt: HTTP 302 / && NF >= 11 {
+				prefix = "xboxdownload_openwrt: HTTP 302 "
+				details = substr($0, index($0, prefix) + length(prefix))
+				sub(/^[^ ]+ /, "", details)
+				entries[(count++) % 32] = $4 "\tHTTP 302\t" $10 "\t" details
+			}
+			/local5\.[^ ]+ dnsmasq\[/ {
+				for (i = 8; i + 3 <= NF; i++) if ($i ~ /^query\[[^]]+\]$/ && $(i+2) == "from") {
+					remote = $(i+3)
+					if (index(clients, "," remote ","))
+						entries[(count++) % 32] = $4 "\tDNS " substr($i, 7, length($i)-7) "\t" remote "\t" $(i+1)
+					break
+				}
+			}
+			END {
+				for (i = count - 1; i >= 0 && i >= count - 32; i--) print entries[i % 32]
+			}'
+}
+
+clear_logs() {
+	if logger -t xboxdownload_openwrt 'LOG RESET'; then result ''; else result logging; fi
+}
+
+status() {
+	local key value routes wan6_state ipv6_block_active=0 ipv6_dns_active=0
+	load_settings
+	lan_ip=
+	lan_network || true
+	services=$(ubus call service list '{"name":"xboxdownload_openwrt"}' 2>/dev/null) || services='{}'
+	service=$(jsonfilter -s "$services" -e '@.xboxdownload_openwrt.instances.service.running')
+	dns=false
+	http=false
+	running=0
+	if [ "$service" = true ] && [ -s "$RUNDIR/ready" ] &&
+		nft list table ip xboxdownload_openwrt >/dev/null 2>&1; then
+		running=1
+		dns=true
+		[ "$mode" != redirect ] || http=true
+	fi
+	if routes=$(ip -6 route show default 2>/dev/null); then
+		if printf '%s\n' "$routes" | grep -q '^default '; then
+			wan6_state=present
+		else
+			wan6_state=absent
+		fi
+	else
+		wan6_state=unknown
+	fi
+	if [ "$ipv6_block" = 1 ] && nft list table inet xboxdownload_openwrt_ipv6 >/dev/null 2>&1; then
+		ipv6_block_active=1
+	fi
+	if [ "$ipv6_dns" = 1 ] && nft list chain inet xboxdownload_openwrt_ipv6 select_xbox_ipv6_dns >/dev/null 2>&1; then
+		ipv6_dns_active=1
+	fi
+
+	json_init
+	json_add_boolean running "$running"
+	[ "$enabled" = 1 ] && json_add_boolean enabled 1 || json_add_boolean enabled 0
+	[ "$dns" = true ] && json_add_boolean dns_running 1 || json_add_boolean dns_running 0
+	[ "$http" = true ] && json_add_boolean http_running 1 || json_add_boolean http_running 0
+	json_add_string wan6_state "$wan6_state"
+	json_add_boolean ipv6_block_active "$ipv6_block_active"
+	json_add_boolean ipv6_dns_active "$ipv6_dns_active"
+	json_add_string upstream_state "$(cat "$UPSTREAM_STATE" 2>/dev/null)"
+	json_add_string router "$lan_ip"
+	for key in client main_ip legacy_ip $EXTRA_KEYS; do
+		eval "value=\${$key}"
+		json_add_string "$key" "$value"
+	done
+	json_add_string error "$(cat "$RUNDIR/error" 2>/dev/null)"
+	json_add_string log "$(read_logs)"
+	json_dump
+}
+
+write_settings() {
+	local key value
+	{
+		for key in $SETTINGS_KEYS; do
+			eval "value=\${$key}"
+			printf "set xboxdownload_openwrt.main.%s='%s'\n" "$key" "$value"
+		done
+	} | uci -q batch && uci -q commit xboxdownload_openwrt
+}
+
+wait_for_service() {
+	local attempt
+	for attempt in 1 2 3 4 5 6 7 8 9 10; do
+		[ ! -s "$RUNDIR/ready" ] || return 0
+		[ ! -s "$RUNDIR/error" ] || return 1
+		sleep 1
+	done
+	return 1
+}
+
+configure() {
+	local validation previous extra key type start_error
+	lock /var/lock/xboxdownload_openwrt.lock || { result busy; return; }
+	trap 'lock -u /var/lock/xboxdownload_openwrt.lock' EXIT
+	load_settings
+	json_get_vars client main_ip legacy_ip enabled extra
+	if [ -n "$extra" ]; then
+		json_load "$extra" || { result invalid; return; }
+		# Earlier LuCI clients only send the IPv6 blocking setting.
+		if json_get_type type ipv6_block && ! json_get_type type ipv6_dns; then
+			ipv6_dns=0
+		fi
+		for key in $EXTRA_KEYS; do
+			if json_get_type type "$key"; then
+				[ "$type" = string ] || { result invalid; return; }
+				json_get_var "$key" "$key"
+			fi
+		done
+	fi
+	lan_ip=
+	lan_network || { [ "$enabled" != 1 ] || { result lan; return; }; }
+	validation=$(validate_settings) || { result "$validation"; return; }
+	client=$(normalize_clients "$client")
+	previous=$(uci -q export xboxdownload_openwrt) || { result save; return; }
+
+	if write_settings; then
+		if [ "$enabled" = 0 ]; then
+			"$INIT" stop >/dev/null 2>&1
+		elif ! "$INIT" restart >/dev/null 2>&1 || ! wait_for_service; then
+			start_error=start
+			if [ "$(cat "$RUNDIR/error" 2>/dev/null)" = 'Could not forward ordinary DNS queries' ]; then
+				start_error=dns_upstream
+			elif [ "$(cat "$RUNDIR/error" 2>/dev/null)" = 'LAN IPv6 unavailable' ]; then
+				start_error=lan_ipv6
+			fi
+			printf '%s\n' "$previous" | uci -q import xboxdownload_openwrt && uci -q commit xboxdownload_openwrt
+			"$INIT" restart >/dev/null 2>&1
+			result "$start_error"
+			return
+		fi
+		result ''
+	else
+		uci -q revert xboxdownload_openwrt
+		result save
+	fi
+}
+
+download_nodes() {
+	curl -q -fsS --proto '=https' --noproxy '*' -H 'Cache-Control: no-cache' --connect-timeout 3 --max-time 8 \
+		--max-filesize 65536 -o "$raw" "$1" || return 1
+	awk -v group="$keyword" '
+		{ sub(/\r$/, "") }
+		NR == 1 { if ($0 != group) exit 1; next }
+		{
+			ip = tolower($1)
+			if (seen[ip]++) next
+			if (group == "AkamaiV6") {
+				if (ip !~ /^[23][0-9a-f][0-9a-f][0-9a-f]:[0-9a-f:]+$/ || ip ~ /:::/) next
+			} else {
+				if (ip !~ /^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+$/) next
+				split(ip, octets, ".")
+				for (i = 1; i <= 4; i++)
+					if (length(octets[i]) > 3 || octets[i] > 255 ||
+						(length(octets[i]) > 1 && octets[i] ~ /^0/)) next
+			}
+			location = ""
+			if (match($0, /\([^()]*\)[[:space:]]*$/)) {
+				location = substr($0, RSTART + 1, RLENGTH - 1)
+				sub(/\)[[:space:]]*$/, "", location)
+				gsub(/[[:cntrl:]]/, " ", location)
+			}
+			printf "%s\t%s\n", ip, location
+			count++
+		}
+		END { if (!count) exit 1 }
+	' "$raw" > "$parsed" && mv -f "$parsed" "$cache"
+}
+
+import_nodes() {
+	json_get_vars source channel
+	case "$channel" in
+		''|auto|mirror) ;;
+		*) result invalid; return ;;
+	esac
+	case "$source" in
+		cn1) keyword=XboxCn1 ;;
+		cn2) keyword=XboxCn2 ;;
+		akamai) keyword=Akamai ;;
+		preferred) keyword=AkamaiV2 ;;
+		akamai6) keyword=AkamaiV6 ;;
+		app) keyword=XboxApp ;;
+		ps) keyword=Ps ;;
+		*) result invalid; return ;;
+	esac
+
+	cache_dir="$RUNDIR/nodes"
+	mkdir -p "$cache_dir" || { result import; return; }
+	cache="$cache_dir/$keyword.tsv"
+	work=$(mktemp -d "$cache_dir/import.XXXXXX") || { result import; return; }
+	trap 'rm -rf "$work"' EXIT
+	raw="$work/source.txt"
+	parsed="$work/nodes.tsv"
+	path="IP/IP.$keyword.txt"
+	repo=skydevil88/XboxDownload
+	if [ "$channel" != mirror ] && download_nodes "https://raw.githubusercontent.com/$repo/refs/heads/master/$path"; then
+		origin=github
+	elif download_nodes "https://cdn.jsdelivr.net/gh/$repo@master/$path"; then
+		origin=mirror
+	elif [ -s "$cache" ]; then
+		origin=stale
+	else
+		result import
+		return
+	fi
+
+	json_init
+	json_add_string origin "$origin"
+	json_add_string nodes "$(cat "$cache")"
+	json_dump
+}
+
+valid_app_url() {
+	case "$1" in *[[:space:][:cntrl:]]*) return 1 ;; esac
+	case "$1" in
+		http://*|https://*) ;;
+		*) return 1 ;;
+	esac
+	local authority="${1#*://}"
+	case "${authority%%/*}" in
+		dl.delivery.mp.microsoft.com|tlu.dl.delivery.mp.microsoft.com|1d.tlu.dl.delivery.mp.microsoft.com)
+			[ "${authority#*/}" != "$authority" ] ;;
+		*) return 1 ;;
+	esac
+}
+
+get_app_url() {
+	local file="$RUNDIR/app-sample-v2" now stamp url document
+	now=$(date +%s)
+	if [ -r "$file" ]; then
+		{
+			read -r stamp
+			read -r url
+		} < "$file"
+		case "$stamp" in ''|*[!0-9]*) stamp=0 ;; esac
+		if [ "$now" -ge "$stamp" ] && [ $((now - stamp)) -lt 120 ] && valid_app_url "$url"; then
+			printf '%s\n' "$url"
+			return
+		fi
+	fi
+	document=$(curl -q -fsS --noproxy '*' --connect-timeout 3 --max-time 6 --max-filesize 131072 \
+		-A XboxDownload -H 'X-Organization: XboxDownload' -H 'X-Author: Devil' \
+		'https://xbox.skydevil.xyz/Game/GetAppPackage?WuCategoryId=986a47b3-0085-4c0c-b3b3-3b806f969b00') || return 1
+	url=$(printf '%s' "$document" | jsonfilter -e '@.data[0].url')
+	valid_app_url "$url" || return 1
+	(umask 077; printf '%s\n%s\n' "$now" "$url" > "$file")
+	printf '%s\n' "$url"
+}
+
+ping_metrics() {
+	local ping_cmd=ping
+	case "$1:$2" in *:6|*:*:*) ping_cmd=ping6 ;; esac
+	LC_ALL=C "$ping_cmd" -c 1 -W 1 -w 2 "$1" 2>/dev/null | awk '
+		/(ttl|hlim)=[0-9]+/ {
+			for (i = 1; i <= NF; i++) {
+				if ($i ~ /^ttl=/) ttl = substr($i, 5)
+				if ($i ~ /^hlim=/) ttl = substr($i, 6)
+				if ($i ~ /^time[=<]/) rtt = substr($i, 6)
+			}
+			if (ttl != "" && rtt != "") print ttl, rtt
+			exit
+		}'
+}
+
+app_ping_fallback() {
+	local ping_target="${ip:-tlu.dl.delivery.mp.microsoft.com}" ping_family=
+	[ -n "$ip" ] || [ "$family" != 6 ] || ping_family=6
+	read -r ttl rtt <<-EOF
+		$(ping_metrics "$ping_target" "$ping_family")
+	EOF
+	json_init
+	json_add_string error sample
+	json_add_string ip "$ip"
+	json_add_string ttl "$ttl"
+	json_add_string rtt "$rtt"
+	json_dump
+}
+
+probe() {
+	json_get_vars group ip timeout sample family file ping_only
+	case "$group" in main|legacy|global|app|ps|ns|ea) ;; *) result invalid; return ;; esac
+	case "$group:$ping_only" in *:|*:0|app:1) ;; *) result invalid; return ;; esac
+	if [ -n "$file" ]; then
+		case "$group:$file" in
+			main:default|main:halo|main:forza|main:gears) ;;
+			*) result invalid; return ;;
+		esac
+	fi
+	[ -z "$ip" ] || node_ip "$ip" || { result cdn; return; }
+	mkdir -p "$RUNDIR" || { result busy; return; }
+	lock -n "$RUNDIR/probe.lock" 2>/dev/null || { result probe_busy; return; }
+	trap 'lock -u "$RUNDIR/probe.lock"' EXIT
+	trap 'exit 1' INT TERM HUP
+
+	port=80
+	user_agent=XboxDownload
+	url=
+	case "$group" in
+		main)
+			host=assets1.xboxlive.cn
+			case "$file" in
+				halo) path=/8/71359f90-2c86-4118-8df8-8546ebd47956/0698b936-d300-4451-b9a0-0be0514bbbe5/1.4206.46191.0.88d41e86-b22b-49f0-bb08-9879d39f287d/Microsoft.254428597CFE2_1.4206.46191.0_neutral__8wekyb3d8bbwe_xs.xvc ;;
+				forza) path=/1/13bab257-5971-49d3-b885-d5238a99668e/3d263e92-93cd-4f9b-90c7-5438150cecbf/3.688.109.0.14726359-c4ce-4a75-b063-d5144b3e9868/Microsoft.624F8B84B80_3.688.109.0_x64__8wekyb3d8bbwe.msixvc ;;
+				gears) path=/8/82e2c767-56a2-4cff-9adf-bc901fd81e1a/1e66a3e7-2f7b-461c-9f46-3ee0aec64b8c/1.1.967.0.4e71a28b-d845-42e5-86bf-36afdd5eb82f/Microsoft.HalifaxBaseGame_1.1.967.0_x64__8wekyb3d8bbwe.msixvc ;;
+				*) path=/Z/routing/extraextralarge.txt ;;
+			esac
+			;;
+		legacy)
+			host=dlassets.xboxlive.cn
+			path=/public/content/0044aef3-bd7e-4478-8782-6191546dcd9a/f6585e19-765c-49c3-ba77-326c3766e05a/1.0.4.0.60281fce-b9c0-49f6-a2b6-027abad22637/ACBF_1.0.4.0_x64__b6krnev7r9sf8
+			;;
+		global) host=xvcf1.xboxlive.com; path=/Z/routing/extraextralarge.txt ;;
+		ps) host=gst.prod.dl.playstation.net; path=/networktest/get_192m ;;
+		ns) host=ctest-dl-lp1.cdn.nintendo.net; path=/30m; user_agent='XboxDownload/Nintendo NX' ;;
+		ea) host=origin-a.akamaihd.net; path=/EA-Desktop-Client-Download/installer-releases/EA%20app.dmg ;;
+		app)
+			if [ "$ping_only" = 1 ] || ! url=$(get_app_url); then
+				app_ping_fallback
+				return
+			fi
+			authority="${url#*://}"
+			host="${authority%%/*}"
+			case "$url" in https://*) port=443 ;; esac
+			;;
+	esac
+	url=${url:-http://$host$path}
+	case "$timeout" in 3|5|10) ;; *) timeout=3 ;; esac
+	case "$sample" in 1|8|30|32|50) ;; *) sample=50 ;; esac
+	limit=$(( sample * 1048576 ))
+	family_flag=-4
+	case "$ip:$family" in *:*:*) family_flag=-6 ;; :6) family_flag=-6 ;; esac
+	set --
+	if [ -n "$ip" ]; then
+		address=$ip
+		[ "$family_flag" = -4 ] || address="[$address]"
+		set -- --resolve "$host:$port:$address"
+	fi
+
+	metrics=$(curl -q "$family_flag" -s --noproxy '*' --connect-timeout 3 --max-time "$timeout" \
+		-A "$user_agent" \
+		--range "0-$(( limit - 1 ))" --max-filesize "$limit" -o /dev/null \
+		-w '%{http_code} %{remote_ip} %{time_connect} %{size_download} %{speed_download}' \
+		"$@" "$url")
+	rc=$?
+	read -r code remote connect bytes speed <<-EOF
+		$metrics
+	EOF
+	ping_ip=${ip:-$remote}
+	ttl=
+	rtt=
+	if node_ip "$ping_ip"; then
+		read -r ttl rtt <<-EOF
+			$(ping_metrics "$ping_ip")
+		EOF
+	fi
+	json_init
+	json_add_int exit "$rc"
+	json_add_string code "$code"
+	json_add_string ip "$remote"
+	json_add_string connect "$connect"
+	json_add_string bytes "$bytes"
+	json_add_string speed "$speed"
+	json_add_string ttl "$ttl"
+	json_add_string rtt "$rtt"
+	json_dump
+}
+
+case "$1:$2" in
+	list:) echo '{"status":{},"configure":{"client":"","main_ip":"","legacy_ip":"","enabled":0,"extra":""},"probe":{"group":"","ip":"","timeout":3,"sample":50,"family":4,"file":"","ping_only":0},"import_nodes":{"source":"","channel":""},"clear_logs":{}}' ;;
+	call:status) status ;;
+	call:clear_logs) clear_logs ;;
+	call:configure|call:probe|call:import_nodes)
+		json_load "$(cat)" || { result invalid; exit; }
+		"$2"
+		;;
+	*) exit 1 ;;
+esac

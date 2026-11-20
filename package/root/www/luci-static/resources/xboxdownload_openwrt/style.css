@@ -1,0 +1,442 @@
+.xb-app {
+	/* Use the rendered LuCI foreground and leave the theme surface visible. */
+	--xb-surface: color-mix(in srgb, currentColor 3%, transparent);
+	--xb-soft: color-mix(in srgb, currentColor 7%, transparent);
+	--xb-line: color-mix(in srgb, currentColor 22%, transparent);
+	--xb-control-line: color-mix(in srgb, currentColor 58%, transparent);
+	--xb-muted: color-mix(in srgb, currentColor 82%, transparent);
+	--xb-green: color-mix(in srgb, currentColor 74%, #479f65);
+	--xb-error: color-mix(in srgb, currentColor 73%, #dd493c);
+	width: 100%;
+	max-width: 1200px;
+	min-width: 0;
+	margin: 0 auto;
+	font-family: "Microsoft YaHei", "Noto Sans CJK SC", sans-serif;
+	color: inherit;
+}
+
+.xb-app [hidden],
+.xb-app .xb-error:empty,
+.xb-app .xb-progress:empty,
+.xb-app .xb-devices:empty {
+	display: none !important;
+}
+
+.xb-app .xb-title {
+	font-size: 24px;
+	line-height: 1.25;
+	margin: 0 0 12px;
+}
+
+.xb-app :is(.xb-title, h3) {
+	padding: 0;
+	background: transparent;
+	box-shadow: none;
+	color: inherit;
+}
+
+.xb-app .xb-title small {
+	color: var(--xb-muted);
+	font-size: 13px;
+	font-weight: 500;
+}
+
+.xb-app h3 {
+	font-size: 16px;
+	line-height: 1.4;
+	margin: 0 0 12px;
+}
+
+.xb-app h3 > label {
+	font: inherit;
+	color: inherit;
+	margin: 0;
+}
+
+.xb-app .xb-device-heading {
+	display: flex;
+	align-items: center;
+	gap: 6px;
+}
+
+.xb-app .xb-help {
+	position: relative;
+	display: inline-flex;
+}
+
+.xb-app .xb-help-button {
+	display: inline-grid;
+	place-items: center;
+	width: 20px;
+	height: 20px;
+	padding: 0;
+	border: 1px solid var(--xb-control-line);
+	border-radius: 50%;
+	background: var(--xb-soft);
+	color: inherit;
+	font-family: inherit;
+	font-size: 12px;
+	font-weight: 600;
+	line-height: 1;
+	cursor: help;
+}
+
+.xb-app .xb-tooltip {
+	display: none;
+	position: absolute;
+	z-index: 5;
+	inset-block-start: 100%;
+	inset-inline-start: 0;
+	width: min(16rem, calc(100vw - 8rem));
+	padding: 8px 10px;
+	border: 1px solid GrayText;
+	border-radius: 6px;
+	background: Canvas;
+	color: CanvasText;
+	font-size: 13px;
+	font-weight: 400;
+}
+
+.xb-app .xb-help:hover .xb-tooltip,
+.xb-app .xb-help:focus-within .xb-tooltip {
+	display: block;
+}
+
+.xb-app p {
+	margin: 0;
+}
+
+.xb-app summary,
+.xb-app input[type="checkbox"] {
+	cursor: pointer;
+}
+
+.xb-app :is(label, summary, .table th, .table td) {
+	color: inherit;
+}
+
+.xb-app .table :is(th, td) {
+	border-color: var(--xb-line);
+}
+
+.xb-app :is(input:not([type="checkbox"]), select, textarea, .btn) {
+	color: inherit;
+	background-color: var(--xb-soft);
+	border-color: var(--xb-control-line);
+}
+
+.xb-app :is(input, textarea)::placeholder {
+	color: var(--xb-muted);
+	opacity: 1;
+}
+
+.xb-app input[type="checkbox"]:not(:checked) {
+	border-color: var(--xb-control-line);
+}
+
+.xb-app .btn:disabled {
+	opacity: .65;
+}
+
+.xb-app :is(button, input, select, textarea, summary):focus-visible {
+	outline: 2px solid var(--xb-green);
+	outline-offset: 2px;
+}
+
+.xb-app .xb-row {
+	display: flex;
+	flex-wrap: wrap;
+	align-items: center;
+	gap: 8px;
+}
+
+.xb-app .xb-between {
+	justify-content: space-between;
+}
+
+.xb-app .xb-muted,
+.xb-app h3 small {
+	color: var(--xb-muted);
+	font-weight: 400;
+}
+
+.xb-app .xb-service-head,
+.xb-app .xb-section,
+.xb-app .xb-best {
+	border: 1px solid var(--xb-line);
+	border-radius: 8px;
+	margin: 12px 0;
+	padding: 16px;
+	background: var(--xb-surface);
+	min-width: 0;
+}
+
+.xb-app .xb-service-head,
+.xb-app .xb-best {
+	background: var(--xb-soft);
+}
+
+.xb-app .xb-service-head {
+	display: flex;
+	flex-wrap: wrap;
+	align-items: center;
+	justify-content: space-between;
+	gap: 12px;
+}
+
+.xb-app .xb-state {
+	display: inline-flex;
+	align-items: center;
+	gap: 8px;
+	font-size: 16px;
+}
+
+.xb-app .xb-state::before {
+	content: "";
+	width: 8px;
+	height: 8px;
+	border-radius: 50%;
+	background: var(--xb-muted);
+}
+
+.xb-app .xb-state[data-state="running"]::before {
+	background: var(--xb-green);
+}
+
+.xb-app .xb-state[data-state="pending"]::before,
+.xb-app .xb-error {
+	color: var(--xb-error);
+}
+
+.xb-app .xb-state[data-state="pending"]::before {
+	background: currentColor;
+}
+
+.xb-app .xb-primary:not(:disabled) {
+	background-color: color-mix(in srgb, var(--xb-green) 17%, transparent);
+	border-color: var(--xb-green);
+	font-weight: 600;
+}
+
+.xb-app .xb-primary:not(:disabled):hover {
+	filter: brightness(.92);
+}
+
+.xb-app .xb-service-grid {
+	display: grid;
+	grid-template-columns: minmax(0, 1.1fr) minmax(0, 1fr);
+	gap: 12px;
+}
+
+.xb-app .xb-service-grid > .xb-section {
+	margin: 0;
+}
+
+.xb-app .xb-fields {
+	display: grid;
+	grid-template-columns: repeat(2, minmax(0, 1fr));
+	gap: 8px 12px;
+	margin-bottom: 12px;
+}
+
+.xb-app .xb-field {
+	display: grid;
+	align-content: start;
+	gap: 4px;
+	min-width: 0;
+}
+
+.xb-app .xb-field :is(input[type="text"], select) {
+	width: 100%;
+	min-width: 0;
+}
+
+.xb-app .xb-mode-field {
+	grid-column: 1 / -1;
+	max-width: 15rem;
+}
+
+.xb-app .xb-check {
+	display: inline-flex;
+	align-items: center;
+	gap: 6px;
+	margin: 0;
+}
+
+.xb-app .xb-check input {
+	margin: 0;
+}
+
+.xb-app .xb-device-picker {
+	flex: 1 1 14rem;
+	min-width: 0;
+}
+
+.xb-app .xb-devices {
+	list-style: none;
+	margin: 0 0 8px;
+}
+
+.xb-app .xb-devices > li {
+	background: var(--xb-soft);
+	border-radius: 4px;
+	margin: 0 0 4px;
+	padding: 8px;
+}
+
+.xb-app .xb-devices small {
+	display: block;
+}
+
+.xb-app .xb-device-hit {
+	margin-top: 4px;
+	overflow-wrap: anywhere;
+}
+
+.xb-app .xb-details {
+	margin-top: 8px;
+}
+
+.xb-app .xb-details[open] > summary {
+	margin-bottom: 8px;
+}
+
+.xb-app .xb-ipv6 {
+	border-top: 1px solid var(--xb-line);
+	margin-top: 12px;
+	padding-top: 12px;
+}
+
+.xb-app .xb-ipv6 p {
+	margin-top: 4px;
+	overflow-wrap: anywhere;
+}
+
+.xb-app .xb-log-head {
+	margin-bottom: 8px;
+}
+
+.xb-app .xb-log-head h3 {
+	margin: 0;
+}
+
+.xb-app .xb-log,
+.xb-app .xb-node-list {
+	overflow: auto;
+	max-height: min(58vh, 32rem);
+}
+
+.xb-app .xb-log td:last-child {
+	overflow-wrap: anywhere;
+}
+
+.xb-app .xb-log td:not(:last-child) {
+	white-space: nowrap;
+}
+
+.xb-app .xb-speed-controls > .xb-row + .xb-row {
+	margin-top: 8px;
+}
+
+.xb-app .xb-speed-options {
+	align-items: start;
+	gap: 8px 16px;
+}
+
+.xb-app .xb-speed-options > details {
+	margin: 0;
+}
+
+.xb-app .xb-speed-options > details[open] {
+	flex-basis: 100%;
+}
+
+.xb-app .xb-test-bar,
+.xb-app .xb-paging {
+	border-top: 1px solid var(--xb-line);
+	padding-top: 8px;
+}
+
+.xb-app .xb-progress {
+	margin-top: 8px;
+}
+
+.xb-app .xb-best > div {
+	display: flex;
+	flex-wrap: wrap;
+	align-items: baseline;
+	gap: 4px 12px;
+}
+
+.xb-app .xb-results {
+	padding: 0;
+}
+
+.xb-app .xb-paging {
+	padding: 8px 12px;
+}
+
+.xb-app .xb-node-table {
+	margin: 0;
+	min-width: 35rem;
+}
+
+.xb-app .xb-node-table thead {
+	position: sticky;
+	top: 0;
+	z-index: 1;
+	background: var(--xb-soft);
+}
+
+.xb-app .xb-node-table .td {
+	vertical-align: middle;
+}
+
+.xb-app .xb-sort.btn {
+	background: transparent;
+	border-color: transparent;
+	font-weight: 600;
+	padding: 4px 6px;
+}
+
+.xb-app .xb-node {
+	display: grid;
+	gap: 2px;
+}
+
+.xb-app .xb-rate,
+.xb-app .xb-ip,
+.xb-app .xb-best-node {
+	font-variant-numeric: tabular-nums;
+	white-space: nowrap;
+}
+
+.xb-app .xb-rate {
+	color: var(--xb-green);
+}
+
+.xb-app .xb-result-bytes {
+	display: block;
+}
+
+.xb-app .xb-mobile-delay {
+	display: none;
+}
+
+@media (max-width: 850px) {
+	.xb-app .xb-service-grid { grid-template-columns: 1fr; }
+}
+
+@media (max-width: 560px) {
+	.xb-app .xb-service-head,
+	.xb-app .xb-section:not(.xb-results),
+	.xb-app .xb-best { padding: 12px; }
+	.xb-app .xb-fields { grid-template-columns: 1fr; }
+	.xb-app .xb-node-table { min-width: 0; }
+	.xb-app .xb-node-table :is(td, th) { padding: 6px; }
+	.xb-app .xb-node-table :is(td, th):nth-child(5) { display: none; }
+	.xb-app .xb-mobile-delay { display: block; }
+	.xb-app :is(.xb-ip, .xb-best-node) { white-space: normal; overflow-wrap: anywhere; }
+	.xb-app .xb-node-table .xb-rate { white-space: normal; }
+	.xb-app :is(input, select, textarea, button) { max-width: 100%; }
+}

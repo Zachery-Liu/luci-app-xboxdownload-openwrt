@@ -1,0 +1,205 @@
+#!/bin/sh
+
+. /usr/share/xboxdownload_openwrt/common.sh
+
+token=$1
+lan_ip=$2
+mode=$3
+configured_upstream=${4:-}
+preferred_upstream=${configured_upstream:-$lan_ip}
+active_upstream=$preferred_upstream
+active_upstream_state=normal
+probe_sequence=0
+local_dns="127.0.0.1:$DNS_PORT"
+local_dns6=${5:-}
+supervisor_pid=$$
+failure='A download service stopped; system DNS restored'
+
+current_instance() {
+	[ "$(cat "$RUNDIR/instance" 2>/dev/null)" = "$token" ]
+}
+
+cleanup() {
+	trap '' USR1 USR2 TERM INT
+	[ -z "$listener_error" ] || failure=$listener_error
+	if lock "$SERVICE_LOCK"; then
+		if current_instance; then
+			rm -f "$RUNDIR/ready" "$UPSTREAM_STATE"
+			clear_rules
+			printf '%s\n' "$failure" > "$RUNDIR/error"
+			logger -t xboxdownload_openwrt "$failure"
+		fi
+		lock -u "$SERVICE_LOCK"
+	fi
+	[ -z "$dns_pid" ] || kill "$dns_pid" 2>/dev/null
+	[ -z "$http_pid" ] || kill "$http_pid" 2>/dev/null
+	[ -z "$timer_pid" ] || kill "$timer_pid" 2>/dev/null
+	wait
+}
+
+watch() {
+	local signal=$1 child_pid
+	shift
+	trap - EXIT USR1 USR2 TERM INT
+	"$@" &
+	child_pid=$!
+	trap 'kill "$child_pid" 2>/dev/null; wait "$child_pid"; exit' TERM INT
+	wait "$child_pid"
+	kill "-$signal" "$supervisor_pid" 2>/dev/null
+}
+
+dns_probe() {
+	/bin/busybox nslookup -timeout=1 -retry=1 -type=A "$HEALTH_HOST" "$1" 2>/dev/null |
+		awk -v ip="$lan_ip" '/^Name:/ { answer=1 }
+			answer && /^Address: / && $2 == ip { found=1 }
+			END { exit !found }'
+}
+
+dns_ready() {
+	kill -0 "$dns_pid" 2>/dev/null && dns_probe "$local_dns" &&
+		{ [ -z "$local_dns6" ] || dns_probe "$local_dns6"; }
+}
+
+forwarding_ready() {
+	local suffix reply
+	probe_sequence=$((probe_sequence + 1))
+	# Use a fresh name so cached positive answers cannot mask a failed upstream.
+	for suffix in com net; do
+		reply=$(/bin/busybox nslookup -timeout=1 -retry=1 -type=A \
+			"xb-$token-$probe_sequence.$suffix." "$1" 2>/dev/null) && return 0
+		case "$reply" in *': NXDOMAIN') return 0 ;; esac
+	done
+	return 1
+}
+
+switch_upstream() {
+	local next=$lan_ip pid switched=1
+	[ "$preferred_upstream" != "$lan_ip" ] || return 1
+	[ "$active_upstream" != "$lan_ip" ] || next=$preferred_upstream
+	forwarding_ready "$next" || return 1
+	lock "$SERVICE_LOCK" || return 1
+	pid=$(cat "$RUNDIR/dnsmasq.pid" 2>/dev/null)
+	if current_instance && [ -n "$pid" ] && write_upstream "$next" && kill -HUP "$pid" 2>/dev/null; then
+		active_upstream=$next
+		active_upstream_state=normal
+		[ "$next" != "$lan_ip" ] || active_upstream_state=fallback
+		switched=0
+	fi
+	lock -u "$SERVICE_LOCK"
+	[ "$switched" -eq 0 ]
+}
+
+publish_upstream_state() {
+	local state=$1
+	[ "$state" != "$last_upstream_state" ] || return 0
+	lock "$SERVICE_LOCK" || return 1
+	if current_instance; then
+		printf '%s\n' "$state" > "$UPSTREAM_STATE"
+		last_upstream_state=$state
+		case "$state" in
+			fallback) logger -t xboxdownload_openwrt 'Custom upstream unavailable; ordinary DNS forwarded to system DNS' ;;
+			unavailable) logger -t xboxdownload_openwrt 'No working upstream for ordinary DNS; local download rules remain active' ;;
+			normal) logger -t xboxdownload_openwrt 'Upstream DNS has recovered' ;;
+		esac
+	fi
+	lock -u "$SERVICE_LOCK"
+}
+
+monitor_upstream() {
+	local failures=0
+	while current_instance; do
+		sleep 30 &
+		timer_pid=$!
+		wait "$timer_pid"
+		timer_pid=
+		current_instance || return
+		if forwarding_ready "$local_dns"; then
+			failures=0
+			publish_upstream_state "$active_upstream_state"
+			continue
+		fi
+		failures=$((failures + 1))
+		[ "$failures" -ge 2 ] || continue
+		if switch_upstream && forwarding_ready "$local_dns"; then
+			failures=0
+			publish_upstream_state "$active_upstream_state"
+		else
+			publish_upstream_state unavailable
+		fi
+	done
+}
+
+http_ready() {
+	[ "$mode" = dns ] && return 0
+	kill -0 "$http_pid" 2>/dev/null && [ "$(uclient-fetch --no-proxy -q -T 1 -O - \
+		"http://$lan_ip:$HTTP_PORT/health.txt" 2>/dev/null)" = xboxdownload-openwrt ]
+}
+
+lock "$SERVICE_LOCK" || exit 1
+if ! current_instance; then
+	lock -u "$SERVICE_LOCK"
+	exit 0
+fi
+# Also remove rules left by a killed supervisor before attempting its restart.
+rm -f "$RUNDIR/ready" "$UPSTREAM_STATE"
+clear_rules
+if [ -n "$configured_upstream" ] && ! write_upstream "$configured_upstream"; then
+	printf '%s\n' 'Could not set DNS upstream' > "$RUNDIR/error"
+	lock -u "$SERVICE_LOCK"
+	exit 1
+fi
+lock -u "$SERVICE_LOCK"
+
+trap cleanup EXIT
+trap 'listener_error="Could not start or verify DNS on port $DNS_PORT"' USR1
+trap 'listener_error="Could not start or verify HTTP on port $HTTP_PORT"' USR2
+trap 'exit 0' TERM INT
+watch USR1 /usr/sbin/dnsmasq -k -C "$RUNDIR/dnsmasq.conf" &
+dns_pid=$!
+if [ "$mode" = redirect ]; then
+	watch USR2 /usr/sbin/uhttpd -f -p "$lan_ip:$HTTP_PORT" \
+		-h "$DATA/http" -D -x /cgi-bin -E /cgi-bin/redirect -T 5 -t 5 -n 4 -N 32 &
+	http_pid=$!
+fi
+
+for attempt in 1 2 3; do
+	[ -z "$listener_error" ] || exit 1
+	failure="Could not start or verify DNS on port $DNS_PORT"
+	if dns_ready; then
+		failure="Could not start or verify HTTP on port $HTTP_PORT"
+		http_ready && break
+	fi
+	[ "$attempt" != 3 ] || exit 1
+	sleep 1
+done
+
+failure='Could not forward ordinary DNS queries'
+if ! forwarding_ready "$local_dns"; then
+	switch_upstream && forwarding_ready "$local_dns" || exit 1
+fi
+
+# Hold the lifecycle lock so a concurrent stop cannot leave new rules behind.
+failed=0
+trap 'failed=1' TERM INT
+lock "$SERVICE_LOCK" || exit 1
+if [ "$failed" = 0 ] && [ -z "$listener_error" ] && current_instance; then
+	failure='Could not activate nftables rules'
+	if nft -f "$RUNDIR/rules.nft"; then
+		printf '%s\n' "$token" > "$RUNDIR/ready"
+		rm -f "$RUNDIR/error"
+		failure='A download service stopped; system DNS restored'
+	else
+		failed=1
+	fi
+else
+	failed=1
+fi
+lock -u "$SERVICE_LOCK"
+trap 'exit 0' TERM INT
+trap 'exit 1' USR1 USR2
+[ "$failed" = 0 ] && [ -z "$listener_error" ] || exit 1
+last_upstream_state=normal
+publish_upstream_state "$active_upstream_state"
+# The listener watchers still interrupt the supervisor immediately on exit.
+monitor_upstream
+exit 1

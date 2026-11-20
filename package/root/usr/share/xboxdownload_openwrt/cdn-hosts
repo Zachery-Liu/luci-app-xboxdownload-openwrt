@@ -1,0 +1,7 @@
+main_ip assets1.xboxlive.cn,assets2.xboxlive.cn,d1.xboxlive.cn,d2.xboxlive.cn
+legacy_ip dlassets.xboxlive.cn,dlassets2.xboxlive.cn
+app_ip dl.delivery.mp.microsoft.com,tlu.dl.delivery.mp.microsoft.com,1d.tlu.dl.delivery.mp.microsoft.com
+ps_ip gst.prod.dl.playstation.net,gs2.ww.prod.dl.playstation.net,zeus.dl.playstation.net,ares.dl.playstation.net
+ns_ip atum.hac.lp1.d4c.nintendo.net,nemof.p01.lp1.nemo.srv.nintendo.net,nemof.hac.lp1.nemo.srv.nintendo.net,ctest-ul.p01.lp1.ctest.srv.nintendo.net,ctest-dl.p01.lp1.ctest.srv.nintendo.net,ctest-ul-lp1.cdn.nintendo.net,ctest-dl-lp1.cdn.nintendo.net
+ea_ip origin-a.akamaihd.net
+battle_ip blzddist1-a.akamaihd.net,downloader.battle.net

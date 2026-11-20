@@ -1,0 +1,8 @@
+{
+	"admin/services/xboxdownload_openwrt": {
+		"title": "Xbox 下载助手",
+		"order": 85,
+		"action": { "type": "view", "path": "xboxdownload_openwrt" },
+		"depends": { "acl": ["luci-app-xboxdownload_openwrt"] }
+	}
+}

@@ -1,0 +1,5 @@
+#!/bin/sh
+
+[ -z "$IPKG_INSTROOT" ] && [ "$IPKG_NO_SCRIPT" != 1 ] || exit 0
+/etc/init.d/xboxdownload_openwrt stop
+/etc/init.d/xboxdownload_openwrt disable

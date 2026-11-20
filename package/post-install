@@ -1,0 +1,18 @@
+#!/bin/sh
+
+[ -z "$IPKG_INSTROOT" ] && [ "$IPKG_NO_SCRIPT" != 1 ] || exit 0
+backup=/var/run/xboxdownload_openwrt/legacy.uci
+if [ -x /etc/init.d/xboxdownload_openwrt ]; then
+	if [ -s "$backup" ]; then
+		legacy='xbox''accel'
+		sed "s/^package $legacy$/package xboxdownload_openwrt/;s/^config $legacy /config xboxdownload_openwrt /" "$backup" |
+			uci -q import xboxdownload_openwrt && uci -q commit xboxdownload_openwrt || exit 1
+		rm -f "$backup" "/etc/config/$legacy"
+	fi
+	/etc/init.d/xboxdownload_openwrt enable
+	if [ "$(uci -q get xboxdownload_openwrt.main.enabled)" = 1 ]; then
+		/etc/init.d/xboxdownload_openwrt restart
+	fi
+fi
+rm -f /tmp/luci-indexcache.*
+/etc/init.d/rpcd reload >/dev/null 2>&1 || true
