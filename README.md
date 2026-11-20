@@ -2,6 +2,8 @@
 
 一个面向 **OpenWrt 25.12 / LuCI** 的轻量插件，提供「服务」和「测速」。接管指定设备发到路由器的 IPv4 DNS 请求，也可为选中的 Xbox 接管 IPv6 DNS。默认用 dnsmasq 和 uhttpd 将 Xbox 下载 HTTP 请求跳到国内 CDN，设备直连 CDN 下载。也可以切换为仅 DNS 选点。
 
+**原版 Xbox 下载助手（电脑端）** [skydevil88/XboxDownload](https://github.com/skydevil88/XboxDownload)
+
 ## 安装与使用
 
 按下文构建后，将 `dist/` 生成的 APK 上传到路由器的 `/tmp`，然后通过 SSH 安装或升级。命令中的文件名对应 0.8.0-r7，可按实际构建版本修改。依赖从路由器配置的软件源获取。
@@ -36,9 +38,12 @@ apk add --allow-untrusted /tmp/luci-app-xboxdownload-openwrt-0.8.0-r7.apk
 
 ## 上游来源
 
-本项目通过 LuCI 管理独立的 dnsmasq 和 uhttpd 实例。Xbox 下载域名、微软商店节点、SRV 发现和备用 CDN 跳转参考了 skydevil88 的 XboxDownload OpenWrt 教程。主下载跳到 `assets1.xboxlive.cn`，旧游戏下载跳到 `dlassets.xboxlive.cn`。升级会保留已选的 CDN IP。 [上游 OpenWrt 教程](https://github.com/skydevil88/XboxDownload/blob/master/README_OpenWrt.md)
+感谢 skydevil88 维护 Xbox 下载助手。本项目是面向 OpenWrt 的独立实现，包括 LuCI 界面、按设备的双栈 DNS 分流、HTTP 302 服务、健康检查和 DNS 回退。 [原版 Windows 客户端与源码](https://github.com/skydevil88/XboxDownload)
 
-测速使用上游项目选用的文件链接，在线节点列表在运行时从 GitHub 或 jsDelivr 获取，微软商店测样本时调用上游的查询接口。 [上游项目](https://github.com/skydevil88/XboxDownload) · [节点数据](https://github.com/skydevil88/XboxDownload/tree/master/IP)
+- **域名与跳转规则。** 参考原版 OpenWrt 教程的下载域名和跳转规则。主下载指向 `assets1.xboxlive.cn`，旧游戏下载指向 `dlassets.xboxlive.cn`。备用 CDN 和 SRV 发现规则也来自上游教程。 [原版 OpenWrt 教程](https://github.com/skydevil88/XboxDownload/blob/master/README_OpenWrt.md)
+- **测速样本。** 沿用原版选用的测试文件链接和 30/50 MiB 样本档位。测速由路由器发起，使用本机 curl 读取下载样本。 [原版测速逻辑](https://github.com/skydevil88/XboxDownload/blob/master/XboxDownload/ViewModels/SpeedTestViewModel.cs)
+- **在线节点列表。** 路由器运行时从上游的 `IP/` 目录读取节点与地区数据，可选择 GitHub 或 jsDelivr。仓库和安装包都不内置上游节点列表。 [上游 IP 数据](https://github.com/skydevil88/XboxDownload/tree/master/IP)
+- **微软商店测速。** 通过原版网站的接口取得样本下载链接。接口暂不可用时，本轮只测节点延迟。 [原版网页版商店](https://xbox.skydevil.xyz)
 
 ## 构建
 
@@ -50,4 +55,4 @@ sh package/build.sh /path/to/openwrt-sdk/staging_dir/host/bin/apk
 
 ## 许可证
 
-本仓库的许可证待定。上游数据、文档及其他第三方内容的授权以各自权利人的条款为准。
+本项目的独立实现以 [GNU Affero General Public License v3.0 only（AGPL-3.0-only）](LICENSE) 发布。上游项目、节点数据、文档及外部服务适用各自的授权与条款。
