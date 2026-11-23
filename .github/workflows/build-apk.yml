@@ -48,6 +48,7 @@ jobs:
           tar --zstd -xf "$archive" -C "$RUNNER_TEMP"
 
           apk_tool="$RUNNER_TEMP/${IMAGEBUILDER_ARCHIVE%.tar.zst}/staging_dir/host/bin/apk"
+          mkdir -p dist
           sudo sh package/build.sh "$apk_tool"
 
           cd dist
