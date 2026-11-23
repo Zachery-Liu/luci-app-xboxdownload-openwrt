@@ -1,11 +1,12 @@
 'use strict';
 'require view';
+'require form';
 'require rpc';
 'require ui';
 'require poll';
+'require session';
 'require xboxdownload_openwrt.speed as speedTest';
 'require xboxdownload_openwrt.devices as devicePicker';
-'require xboxdownload_openwrt.ipv6 as xboxIPv6';
 
 const getStatus = rpc.declare({ object: 'xboxdownload_openwrt', method: 'status', expect: { '': {} } });
 const configure = rpc.declare({
@@ -14,19 +15,28 @@ const configure = rpc.declare({
 });
 const clearLogs = rpc.declare({ object: 'xboxdownload_openwrt', method: 'clear_logs', expect: { '': {} } });
 const extraKeys = ['upstream', 'global_ip', 'app_ip', 'ps_ip', 'ns_ip', 'ea_ip', 'battle_ip',
-	'mode', 'filter_aaaa', 'log_mode', 'log_path', 'ipv6_dns', 'ipv6_block', 'ipv6_block_ip', 'ipv6_block_mac'];
+	'mode', 'filter_aaaa', 'log_mode', 'log_path', 'ipv6_devices'];
+const pendingKey = 'xboxdownload-openwrt.pending-settings';
+const viewPath = 'admin/services/xboxdownload_openwrt';
+const settingDefaults = { mode: 'redirect', filter_aaaa: '0', log_mode: 'http', log_path: '0' };
 const errors = {
 	client: '请输入 1–8 个局域网设备 IPv4 地址，并确保它们和路由器地址不同。',
 	cdn: 'CDN 节点必须是公网 IPv4 或 IPv6 地址。',
 	upstream: '上游 DNS 必须是有效 IP 地址。',
 	ipv6: '已配置 IPv6 CDN 节点，请先关闭 AAAA 过滤。',
-	ipv6_device: '请从加速设备中选择 Xbox，并确认它的 MAC 地址。',
-	ipv6_filter: '保留 IPv6 时，请先在高级设置中关闭「过滤已选设备的 AAAA 应答」。',
-	ipv6_cdn: '关闭 Xbox 公网 IPv6 前，请把 Xbox COM、cn1、cn2 节点切换到 IPv4 或自动解析。',
+	ipv6_device: '请检查加速设备的 IPv4 与 IPv6 策略。接管 DNS 或关闭公网 IPv6 时，需要填写设备的 MAC 地址。',
+	ipv6_mac_duplicate: '同一个 MAC 地址只能配置一次 IPv6 策略，请检查加速设备列表。',
+	ipv6_reload: '设备配置已升级，请刷新页面后再保存。',
+	ipv6_filter: '保留 IPv6 时，请先关闭「过滤已选设备的 AAAA 应答」。',
+	ipv6_cdn: '关闭 Xbox 公网 IPv6 前，请把 Xbox com、cn1、cn2 节点切换到 IPv4 或自动解析。',
 	lan: '路由器的 lan 接口没有可用的 IPv4 地址。',
-	lan_ipv6: 'LAN 暂无可用的 IPv6 链路本地地址，已尝试恢复原设置。',
-	dns_upstream: '无法验证普通域名的 DNS 转发，已尝试恢复原设置。',
-	start: '服务启动失败，已尝试恢复原设置。请查看系统日志。',
+	lan_ipv6: 'LAN 暂无可用的 IPv6 链路本地地址，已恢复原设置。',
+	dns_upstream: '无法验证普通域名的 DNS 转发，已恢复原设置。',
+	http_redirect: 'HTTP 302 跳转检查失败，已恢复原设置。',
+	start: '服务启动失败，已恢复原设置。请查看系统日志。',
+	stop: '无法确认服务已停止，已恢复原设置。',
+	rollback: '无法恢复旧设置或服务。已撤下接管规则，请查看系统日志。',
+	rollback_rules: '无法恢复旧设置或服务，也无法确认接管规则已撤下。请查看系统日志。',
 	save: '保存设置失败。',
 	busy: '配置正在更新，请稍后再试。'
 };
@@ -37,150 +47,221 @@ const serviceErrors = {
 	'Could not set DNS upstream': '无法加载 DNS 上游配置，设备使用系统 DNS。',
 	'Could not forward ordinary DNS queries': '无法验证普通域名的 DNS 转发，加速启动失败，设备使用系统 DNS。',
 	'Could not start or verify HTTP on port 18080': '无法验证 HTTP 监听（18080），设备继续使用系统 DNS。',
+	'Could not verify HTTP 302 redirects': 'HTTP 302 跳转检查失败，已撤下加速接管规则。',
+	'Could not remove interception rules': '无法撤下接管规则，请查看系统日志。',
+	'Could not restore previous settings or service': '无法恢复旧设置或服务，已撤下接管规则。',
+	'Could not restore previous settings or verify rule removal': '无法恢复旧设置或服务，也无法确认接管规则已撤下。',
 	'A download service stopped; system DNS restored': '加速监听已退出，设备已恢复使用系统 DNS。',
 	'Could not activate nftables rules': '无法启用转发规则，设备继续使用系统 DNS。'
 };
 
-function notify(message) {
-	ui.addNotification(null, E('p', {}, [message]), 'error');
+function notify(message, style = 'error') {
+	ui.addNotification(null, E('p', {}, [message]), style);
 }
 
-function field(label, input, control) {
-	return E('div', { class: 'xb-field' }, [
-		E('label', { for: control || input.id }, [label]), input
-	]);
+function showReadonlyValues(container, label, values) {
+	for (const [index, value] of values.entries()) {
+		const row = container.children[index] || container.appendChild(new ui.Textfield(value, { readonly: true }).render());
+		const input = row.querySelector('input');
+		input.setAttribute('aria-label', values.length > 1 ? label + ' ' + (index + 1) : label);
+		if (input.value !== value) input.value = value;
+	}
+	while (container.children.length > values.length)
+		container.lastElementChild.remove();
 }
 
-function helpTooltip(id, label, description) {
-	const button = E('button', {
-		type: 'button', class: 'xb-help-button', 'aria-label': label,
-		'aria-describedby': id
+function settingsSection(name, title, initial) {
+	const map = new form.JSONMap({ [name]: { ...initial } });
+	return map.section(form.NamedSection, name, name, title);
+}
+
+async function renderSettings(section) {
+	const node = await section.map.render();
+	node.id = 'cbi-xboxdownload-' + section.section;
+	return node;
+}
+
+function helpTooltip(label, description) {
+	return E('button', {
+		type: 'button', class: 'cbi-button cbi-button-neutral xb-help-button', 'aria-label': label,
+		'data-tooltip': description, 'data-tooltip-style': 'xb-help-tooltip', 'aria-description': description
 	}, ['?']);
-	button.addEventListener('click', () => button.focus());
-	return E('span', { class: 'xb-help' }, [
-		button,
-		E('span', { id: id, class: 'xb-tooltip', role: 'tooltip' }, [description])
-	]);
 }
 
-function address(id, value, placeholder) {
-	return E('input', {
-		id: id, type: 'text', class: 'cbi-input-text',
-		autocomplete: 'off', value: value || '', placeholder: placeholder || ''
-	});
-}
-
-function select(id, value, choices) {
-	const input = E('select', { id: id, class: 'cbi-input-select' }, choices.map(
-		([key, label]) => E('option', { value: key }, [label])));
-	input.value = value;
-	return input;
-}
-
-function checkbox(id, value) {
-	const input = E('input', { id: id, type: 'checkbox' });
-	input.checked = value === '1';
-	return input;
-}
-
-function drawLog(text) {
-	const rows = text ? text.split('\n').map(line => line.split('\t')).filter(row => row.length === 4) : [];
-	return E('table', { class: 'table' }, [
-		E('thead', {}, [E('tr', { class: 'tr table-titles' },
-			['时间', '客户端 IP', '请求', '域名 / 跳转'].map(label => E('th', { class: 'th', scope: 'col' }, [label])))]),
-		E('tbody', {}, rows.length ? rows.map(([time, type, client, detail]) =>
-			E('tr', { class: 'tr' }, [time, client, type, detail].map(value => E('td', { class: 'td' }, [value])))) :
-			[E('tr', { class: 'tr' }, [E('td', { class: 'td', colspan: 4 }, ['暂无记录。'])])])
-	]);
+function normalizeClients(value) {
+	return Array.from(new Set(value.split(/[\s,，]+/).filter(Boolean))).join(',');
 }
 
 return view.extend({
-	load: getStatus,
-	handleSave: null,
-	handleSaveApply: null,
-	handleReset: null,
+	load: function() {
+		const cached = session.getLocalData('menu');
+		const oldEntry = cached?.children?.admin?.children?.services?.children?.xboxdownload_openwrt;
+		if (oldEntry?.action?.type === 'view') {
+			ui.menu.flushCache();
+			if (session.getLocalData('menu') == null) location.reload();
+		}
+		return getStatus();
+	},
+	handleSave: function() {
+		return this.stageSettings();
+	},
+	handleReset: function() {
+		return this.restoreSettings();
+	},
+	handleSaveApply: function() {
+		return this.submitSettings();
+	},
 
-	render: function(initial) {
+	render: async function(initial) {
 		const nodeLabels = {
-			main_ip: 'Xbox cn1 下载 IP', legacy_ip: 'Xbox cn2 下载 IP', global_ip: 'Xbox COM 下载 IP',
+			main_ip: 'Xbox cn1 下载 IP', legacy_ip: 'Xbox cn2 下载 IP', global_ip: 'Xbox com 下载 IP',
 			app_ip: '微软商店 / Xbox 应用 IP', ps_ip: 'PlayStation 下载 IP', ns_ip: 'Nintendo Switch 下载 IP',
 			ea_ip: 'EA 下载 IP', battle_ip: '战网国际服下载 IP'
 		};
-		const inputs = {};
-		Object.keys(nodeLabels).forEach(key => { inputs[key] = address('xbox-' + key, initial[key], '自动解析'); });
-		inputs.global_ip.placeholder = '留空按照服务模式处理';
-		inputs.client = address('xbox-client', initial.client, '多个 IPv4 用逗号分隔');
-		inputs.client.setAttribute('aria-label', '手动输入设备 IPv4');
-		const devices = devicePicker.render(inputs.client);
-		const ipv6 = xboxIPv6.render(devices, initial, helpTooltip('xbox-ipv6-help', 'IPv6 与下载加速',
-			'保留 IPv6 时，请让 Xbox 使用路由器的 DNS。插件为配置了 IPv4 节点的下载域名返回 IPv4 地址，普通域名的 IPv6 解析照常。关闭公网 IPv6 时，请让 Xbox 使用路由器的 IPv4 DNS。'));
-		inputs.upstream = address('xbox-upstream', initial.upstream, '使用路由器现有 DNS');
-		inputs.mode = select('xbox-mode', initial.mode || 'redirect', [
-			['redirect', 'DNS + HTTP 302'], ['dns', '仅 DNS 选点']
+		const downloads = settingsSection('downloads', 'Xbox 下载线路', initial);
+		const logSettings = settingsSection('logging', null, initial);
+		const logTable = new ui.Table(['时间', '客户端 IP', '请求', '域名 / 跳转'], { sortable: false });
+		const log = E('div', { class: 'xb-log' }, [logTable.render()]);
+		const clear = E('button', { class: 'cbi-button cbi-button-remove', type: 'button' }, ['清空插件日志']);
+		const options = {};
+		function option(section, type, key, label, description) {
+			const value = section.option(type, key, label, description);
+			options[key] = value;
+			return value;
+		}
+		const mode = option(downloads, form.ListValue, 'mode', '服务模式');
+		mode.default = 'redirect';
+		mode.value('redirect', 'DNS + HTTP 302');
+		mode.value('dns', '仅 DNS 选点');
+		for (const [key, label] of Object.entries(nodeLabels)) {
+			option(downloads, form.Value, key, label).placeholder = '自动解析';
+		}
+		option(downloads, form.Value, 'upstream', '上游 DNS').placeholder = '使用路由器现有 DNS';
+		option(downloads, form.Flag, 'filter_aaaa', '过滤已选设备的 AAAA 应答',
+			'移除插件 DNS 应答中的 IPv6 地址，普通域名也受影响。使用「保留 IPv6，接管 DNS」时请保持关闭。');
+		logSettings.tab('recent-logs', '最近日志');
+		logSettings.tab('log-settings', '日志设置');
+		const recentLogs = logSettings.taboption('recent-logs', form.DummyValue, '_recent_logs');
+		recentLogs.render = () => E([
+			log,
+			E('div', { class: 'cbi-page-actions' }, [E('small', { class: 'xb-muted' }, ['最多 32 条']), ' ', clear])
 		]);
-		inputs.filter_aaaa = checkbox('xbox-filter-aaaa', initial.filter_aaaa);
-		inputs.filter_aaaa.setAttribute('aria-describedby', 'xbox-filter-aaaa-help');
-		inputs.log_mode = select('xbox-log-mode', initial.log_mode || 'http', [
-			['http', '仅 HTTP 302'], ['all', 'HTTP 302 和 DNS 查询'], ['off', '关闭']
-		]);
-		inputs.log_path = checkbox('xbox-log-path', initial.log_path);
+		const logMode = logSettings.taboption('log-settings', form.ListValue, 'log_mode', '记录范围');
+		logMode.default = 'http';
+		logMode.value('http', '仅 HTTP 302');
+		logMode.value('all', 'HTTP 302 和 DNS 查询');
+		logMode.value('off', '关闭');
+		options.log_mode = logMode;
+		options.log_path = logSettings.taboption('log-settings', form.Flag, 'log_path', '显示跳转路径', '省略查询参数。');
+		const [downloadForm, logForm] = await Promise.all([downloads, logSettings].map(renderSettings));
+		const widgets = Object.fromEntries(Object.entries(options).map(([key, value]) => [
+			key, value.getUIElement(value.section.section)
+		]));
+		const goSpeed = E('button', { class: 'cbi-button cbi-button-action', type: 'button' }, ['去测速选节点']);
+		widgets.mode.node.parentElement.classList.add('xb-row');
+		widgets.mode.node.after(goSpeed);
+
+		const devices = await devicePicker.render(initial, () =>
+			helpTooltip('如何查看 Xbox 设备名称',
+				'按手柄上的 Xbox 键，依次打开「档案和系统 → 设置 → 系统 → 主机信息 → 名称」。默认名称为 XBOX，改过名则以主机显示为准。'));
 		const status = E('strong', { class: 'xb-state', role: 'status' });
-		const setup = E('p', { class: 'xb-muted' });
 		const serviceError = E('p', { class: 'xb-error', role: 'status' });
-		const log = E('div', { class: 'xb-log' });
-		const primary = E('button', { class: 'btn xb-primary', type: 'button' });
-		const stop = E('button', { class: 'btn', type: 'button' }, ['停止服务']);
-		const saveOnly = E('button', { class: 'btn', type: 'button' }, ['保存设置']);
-		const clear = E('button', { class: 'btn', type: 'button' }, ['清空插件日志']);
-		const goSpeed = E('button', { class: 'btn', type: 'button' }, ['去测速选节点']);
+		const primary = E('button', { class: 'cbi-button cbi-button-apply', type: 'button' });
+		const stop = E('button', { class: 'cbi-button cbi-button-negative', type: 'button' }, ['停止服务']);
+		const goDevices = E('button', { class: 'cbi-button cbi-button-add', type: 'button' }, ['添加设备']);
+		const manageDevices = E('button', { class: 'cbi-button cbi-button-action', type: 'button' }, ['管理设备']);
+		const overviewIPv4 = E('div', { class: 'xb-overview-values' });
+		const overviewIPv6 = E('div', { class: 'xb-overview-values' });
+		const overviewDevices = E('div', { class: 'xb-overview-values' });
+		const overviewCount = E('span', { class: 'xb-muted' });
+		const overviewEmpty = E('p', { class: 'xb-muted' }, ['尚未选择设备']);
+		const overviewPending = E('small', { class: 'xb-muted', hidden: true }, ['设备选择待保存']);
+		const ipv6HelpText = '使用加速时，请让 Xbox 使用路由器的 DNS。Xbox 实际收到的 DNS 以主机网络设置为准。';
+		const ipv6Help = helpTooltip('IPv6 与下载加速', ipv6HelpText);
+		const overview = settingsSection('overview', '总览', {});
+		overview.option(form.DummyValue, '_ipv4', '路由器 IPv4 DNS').renderWidget = () => overviewIPv4;
+		overview.option(form.DummyValue, '_ipv6', '路由器 IPv6 DNS').renderWidget = () =>
+			E('div', { class: 'xb-row' }, [overviewIPv6, ipv6Help]);
+		overview.option(form.DummyValue, '_devices', '已选设备').renderWidget = () => E([
+			E('div', { class: 'xb-row' }, [overviewCount, overviewPending, manageDevices]),
+			overviewEmpty, overviewDevices
+		]);
+		const overviewForm = await renderSettings(overview);
+		overviewForm.classList.add('xb-overview');
 		let state = initial;
+		let pending = session.getLocalData(pendingKey);
 		let updating = false;
 		let shown;
 
-		function updateControls() {
-			const settings = fields();
-			const defaults = { mode: 'redirect', filter_aaaa: '0', log_mode: 'http', log_path: '0', ipv6_dns: '1', ipv6_block: '0' };
-			const dirty = Object.keys(settings).some(key => {
-				const saved = state[key] || defaults[key] || '';
-				if (key === 'client') {
-					const normalize = value => Array.from(new Set(value.split(/[\s,，]+/).filter(Boolean))).join(',');
-					return normalize(settings.client) !== normalize(saved);
+		function routerSettingsChanged(settings) {
+			return Object.keys(settings).some(key => {
+				const saved = state[key] || settingDefaults[key] || '';
+				if (key === 'client') return normalizeClients(settings.client) !== normalizeClients(saved);
+				if (key === 'ipv6_devices') {
+					const active = value => value.toUpperCase().split(',').filter(row => !row.endsWith('/SYSTEM')).sort().join(',');
+					return active(settings[key]) !== active(saved);
 				}
 				return settings[key] !== saved;
 			});
-			const retryUpstream = state.running && !dirty && ['fallback', 'unavailable'].includes(state.upstream_state);
-			primary.hidden = state.running && !dirty && !retryUpstream;
-			primary.textContent = retryUpstream ? '重试上游 DNS' :
-				state.running ? '保存设置' : state.enabled ? '重试启动' : '保存并启动';
-			primary.disabled = updating || !state.router || !devices.selected().length;
+		}
+
+		function updateControls() {
+			const settings = fields();
+			const hasDevices = devices.selected().length > 0;
+			widgets.global_ip.setPlaceholder(settings.mode === 'dns' ? '留空使用系统 DNS' : '留空默认跳转到 CN 下载');
+			const retryUpstream = state.running && ['fallback', 'unavailable'].includes(state.upstream_state);
+			primary.hidden = state.running && !retryUpstream;
+			primary.textContent = retryUpstream ? '重试上游 DNS' : state.enabled ? '重试启动' : '启动服务';
+			primary.disabled = updating || !state.router || !state.client;
+			primary.title = !state.client ? '请先添加设备并保存设置' : '';
+			goDevices.hidden = hasDevices;
+			manageDevices.hidden = !hasDevices;
+			overviewPending.hidden = normalizeClients(settings.client) === normalizeClients(state.client || '');
 			stop.hidden = !state.enabled;
 			stop.disabled = updating;
-			saveOnly.hidden = state.enabled || !dirty;
-			saveOnly.disabled = updating;
 			clear.disabled = updating || !state.log;
 		}
 
 		function update(data) {
 			state = data;
-			ipv6.update(data);
-			devices.updateHits(data);
-			status.textContent = data.running ? '服务运行中' : !data.enabled ? '服务已停止' :
+			devices.update(data);
+			const addresses = (data.lan_ipv6_dns || '').split(/\s+/).filter(Boolean);
+			showReadonlyValues(overviewIPv4, '路由器 IPv4 DNS', [data.router || '无可用地址']);
+			showReadonlyValues(overviewIPv6, '路由器 IPv6 DNS', addresses.length ? addresses : ['无可用地址']);
+			const route = { present: '已发现 IPv6 默认路由。', absent: '未发现 IPv6 默认路由。' };
+			const announced = (data.lan_advertised_dns || '').split(/\s+/).filter(ip => ip.includes(':'));
+			ipv6Help.dataset.tooltip = ipv6HelpText + (route[data.wan6_state] || '') +
+				(announced.length ? '配置的 IPv6 通告 DNS 为 ' + announced.join('、') + '。' : '');
+			ipv6Help.setAttribute('aria-description', ipv6Help.dataset.tooltip);
+			const serviceLabel = data.running ? '服务运行中' : !data.enabled ? '服务已停止' :
 				data.error ? '服务异常' : '服务正在启动';
+			if (status.textContent !== serviceLabel) status.textContent = serviceLabel;
 			status.dataset.state = data.running ? 'running' : data.enabled ? 'pending' : 'stopped';
 			const upstreamNotice = {
 				fallback: '自定义上游 DNS 无响应，普通域名已切回系统 DNS，下载加速继续运行。',
 				unavailable: 'DNS 上游无响应，普通域名可能无法解析。已配置的下载规则继续生效。'
 			};
-			serviceError.textContent = data.error ? serviceErrors[data.error] || data.error :
+			const notice = data.error ? serviceErrors[data.error] || data.error :
+				!data.router ? '路由器的 LAN 接口没有可用的 IPv4 地址。' :
 				data.running ? upstreamNotice[data.upstream_state] || '' : '';
-			setup.textContent = data.router ? '路由器 IPv4 DNS ' + data.router +
-				(data.running ? (data.http_running ? ' · DNS + HTTP 302' : ' · 仅 DNS 选点') : '') :
-				'路由器的 lan 接口没有可用的 IPv4 地址。';
+			if (serviceError.textContent !== notice) serviceError.textContent = notice;
 			if (shown !== data.log) {
 				shown = data.log;
-				log.replaceChildren(drawLog(data.log));
+				const rows = (data.log || '').split('\n').map(line => line.split('\t')).filter(row => row.length === 4);
+				logTable.update(rows, '暂无记录。').querySelectorAll('th[data-sortable-row]')
+					.forEach(th => th.removeAttribute('data-sortable-row'));
 			}
 			updateControls();
+		}
+
+		function updateDeviceOverview() {
+			const selected = devices.selected();
+			overviewCount.textContent = selected.length + ' 台';
+			overviewCount.hidden = !selected.length;
+			overviewEmpty.hidden = selected.length > 0;
+			overviewDevices.hidden = !selected.length;
+			showReadonlyValues(overviewDevices, '已选设备', selected.map(({ ip, device }) =>
+				device ? device.name + ' · ' + ip : ip));
 		}
 
 		async function save(enabled, settings) {
@@ -194,6 +275,8 @@ return view.extend({
 					JSON.stringify(extra));
 				if (response.error) {
 					notify(errors[response.error] || '参数无效或服务暂时不可用。');
+					if (response.error === 'rollback' || response.error === 'rollback_rules')
+						await getStatus().then(update, () => {});
 					return false;
 				}
 				update(await getStatus());
@@ -208,16 +291,58 @@ return view.extend({
 		}
 
 		function fields() {
-			const settings = Object.fromEntries(Object.entries(inputs).map(([key, input]) => [
-				key, input.type === 'checkbox' ? input.checked ? '1' : '0' : input.value.trim()
+			const settings = Object.fromEntries(Object.entries(widgets).map(([key, widget]) => [
+				key, (widget.getValue() || '').trim()
 			]));
-			settings.client = settings.client.replace(/，/g, ',');
-			return Object.assign(settings, ipv6.values());
+			return Object.assign(settings, devices.values());
 		}
 
-		primary.addEventListener('click', function() { save(1, fields()); });
-		stop.addEventListener('click', function() { save(0, state); });
-		saveOnly.addEventListener('click', function() { save(0, fields()); });
+		primary.addEventListener('click', async function() {
+			if (await save(1, state)) speed.refresh();
+		});
+		stop.addEventListener('click', async function() {
+			if (await save(0, state)) speed.refresh();
+		});
+		function storePending(draft) {
+			pending = draft;
+			return session.setLocalData(pendingKey, draft);
+		}
+		this.stageSettings = function() {
+			if (updating || L.hasViewPermission() === false) return;
+			const settings = fields();
+			const speedSettings = speed.draftSettings();
+			if (!routerSettingsChanged(settings) && !speed.settingsChanged(speedSettings)) {
+				storePending(null);
+				return;
+			}
+			const stored = storePending({ settings, speedSettings });
+			notify(stored ? '已保存，等待应用。' : '修改已暂存在当前页面。', 'info');
+		};
+		this.restoreSettings = function() {
+			if (updating || L.hasViewPermission() === false) return;
+			const settings = pending?.settings || state;
+			for (const [key, widget] of Object.entries(widgets))
+				widget.setValue(settings[key] || settingDefaults[key] || '');
+			speed.restoreDraft(pending?.speedSettings);
+			devices.restoreDraft(settings);
+		};
+		this.submitSettings = async function() {
+			if (updating || L.hasViewPermission() === false) return;
+			const settings = fields();
+			const speedSettings = speed.draftSettings();
+			const changed = routerSettingsChanged(settings);
+			if (!changed && !speed.settingsChanged(speedSettings)) {
+				storePending(null);
+				return;
+			}
+			storePending({ settings, speedSettings });
+			// Both LuCI apply actions use the plugin's configuration transaction.
+			if (changed && !await save(state.enabled ? 1 : 0, settings)) return;
+			const persisted = speed.applySettings(speedSettings);
+			storePending(null);
+			notify(persisted ? '已保存并应用。' : '测速设置仅在当前页面生效，浏览器无法保存。', 'info');
+			updateControls();
+		};
 		clear.addEventListener('click', async function() {
 			if (updating) return;
 			updating = true;
@@ -234,83 +359,101 @@ return view.extend({
 			}
 		});
 
-		const speed = speedTest.render(async function(group, ip) {
-			const key = group + '_ip';
-			const settings = Object.assign({}, state, { [key]: ip });
-			if (!await save(state.enabled ? 1 : 0, settings) || state[key] !== ip)
-				return false;
-			inputs[key].value = ip;
+		const speed = await speedTest.render(function(group, ip) {
+			widgets[group + '_ip'].setValue(ip);
 			updateControls();
-			return true;
-		}, group => ({ ip: state[group + '_ip'], running: state.running }));
-		const modeField = field('服务模式', inputs.mode);
-		modeField.classList.add('xb-mode-field');
-
-		const service = E('div', { 'data-tab': 'service', 'data-tab-title': '服务' }, [
-			E('div', { class: 'xb-service-head' }, [
-				E('div', {}, [status, setup, serviceError]),
-				E('div', { class: 'xb-row' }, [primary, stop, saveOnly])
-			]),
-			E('div', { class: 'xb-service-grid' }, [
-				E('section', { class: 'xb-section' }, [
-					E('h3', { class: 'xb-device-heading' }, [
-						E('label', { for: devices.control }, ['加速设备']),
-						helpTooltip('xbox-device-name-help', '如何查看 Xbox 设备名称',
-							'按手柄上的 Xbox 键，依次打开「档案和系统 → 设置 → 系统 → 主机信息 → 名称」。默认名称为 XBOX，改过名则以主机显示为准。')
-					]),
-					devices.element, ipv6.element
-				]),
-				E('section', { class: 'xb-section' }, [
-					E('h3', {}, ['Xbox 下载线路']),
-					E('div', { class: 'xb-fields' }, [
-						modeField,
-						field(nodeLabels.main_ip, inputs.main_ip),
-						field(nodeLabels.legacy_ip, inputs.legacy_ip)
-					]),
-					goSpeed,
-					E('details', { class: 'xb-details' }, [E('summary', {}, ['高级设置']),
-						E('div', { class: 'xb-fields' }, [
-							field('上游 DNS', inputs.upstream),
-							...['global_ip', 'app_ip', 'ps_ip', 'ns_ip', 'ea_ip', 'battle_ip'].map(key => field(nodeLabels[key], inputs[key]))
-						]),
-						E('label', { class: 'xb-check', for: inputs.filter_aaaa.id }, [inputs.filter_aaaa, '过滤已选设备的 AAAA 应答']),
-						E('p', { id: 'xbox-filter-aaaa-help', class: 'xb-muted' }, [
-							'移除插件 DNS 应答中的 IPv6 地址，普通域名也受影响。使用「保留 IPv6，接管 DNS」时请保持关闭。'
-						])
-					])
-				])
-			]),
-			E('section', { class: 'xb-section' }, [
-				E('div', { class: 'xb-row xb-between xb-log-head' }, [
-					E('h3', {}, ['最近日志 ', E('small', {}, ['最多 32 条'])]),
-					E('div', { class: 'xb-row' }, [
-						E('label', { class: 'xb-row', for: inputs.log_mode.id }, ['记录范围', inputs.log_mode]),
-						E('label', { class: 'xb-check', for: inputs.log_path.id }, [inputs.log_path, '显示跳转路径（省略查询参数）']),
-						clear
-					])
-				]), log
-			])
+		}, function(group) {
+			const key = group + '_ip';
+			return { saved: state[key] || '', draft: (widgets[key].getValue() || '').trim(), running: state.running };
+		});
+		const toolbar = E('section', { class: 'cbi-section xb-row xb-service-head', 'aria-label': '服务状态' }, [
+			E('div', {}, [status, serviceError]),
+			E('div', { class: 'xb-row' }, [goDevices, primary, stop])
 		]);
-		service.addEventListener('input', updateControls);
-		service.addEventListener('change', updateControls);
-		devices.element.addEventListener('xbox-devices-changed', updateControls);
-		service.addEventListener('cbi-tab-active', devices.loadOnce);
-		const tabs = E('div', {}, [service, speed]);
+		const service = E('div', {}, [overviewForm, downloadForm]);
+		const pages = { service, devices: devices.element, speed: speed.element, logs: logForm };
+		const header = await new form.JSONMap({}, 'Xbox 下载助手', [
+			'在 OpenWrt 上为选定设备加速 Xbox 下载。 ',
+			E('a', {
+				href: 'https://github.com/Zachery-Liu/luci-app-xboxdownload-openwrt/wiki',
+				target: '_blank',
+				rel: 'noopener noreferrer'
+			}, ['使用说明'])
+		]).render();
+		header.id = 'cbi-xboxdownload-header';
+		const title = header.querySelector('h2');
+		const description = header.querySelector('.cbi-map-descr');
+		title.classList.add('xb-title');
+		title.append(' ', E('small', {}, '(OpenWrt)'));
+		devices.element.addEventListener('xbox-devices-changed', function() {
+			updateDeviceOverview();
+			updateControls();
+		});
+		service.addEventListener('cbi-tab-active', () => {
+			if (devices.selected().length) devices.loadOnce();
+		});
+		devices.element.addEventListener('cbi-tab-active', devices.loadOnce);
+		const tabs = E('div', {}, Object.values(pages));
+		tabs.addEventListener('input', updateControls);
+		tabs.addEventListener('change', updateControls);
 		const app = E('div', { class: 'xb-app' }, [
 			E('link', { rel: 'stylesheet', href: L.resource('xboxdownload_openwrt/style.css') }),
-			E('h2', { class: 'xb-title' }, ['Xbox 下载助手 ', E('small', {}, ['(OpenWrt)'])]),
-			tabs
+			header, toolbar, tabs
 		]);
-		// LuCI inserts the tab menu before the pane container in its parent.
-		ui.tabs.initTabGroup(tabs.childNodes);
-		goSpeed.addEventListener('click', function() {
-			const tab = Array.from(app.querySelectorAll('.cbi-tabmenu a')).find(link => link.textContent.trim() === '测速');
-			if (tab) tab.click();
+		document.addEventListener('tooltip-open', function(event) {
+			const tooltip = event.target;
+			if (!tooltip.classList.contains('xb-help-tooltip')) return;
+			const trigger = event.detail.target.getBoundingClientRect();
+			const rightLimit = document.documentElement.clientWidth - tooltip.offsetWidth - 8;
+			tooltip.style.left = Math.max(8, Math.min(trigger.left, rightLimit)) + window.scrollX + 'px';
 		});
+		const urls = Object.fromEntries(Object.keys(pages).map(name => [name, L.url(...viewPath.split('/'), name)]));
+		const paths = new Map(Object.entries(urls).map(([name, url]) => [new URL(url, location.href).pathname, name]));
+		let activePage;
+		function openTab(name, push = true) {
+			if (activePage === name) return;
+			activePage = name;
+			if (push) history.pushState(null, '', urls[name]);
+			description.hidden = name !== 'service';
+			for (const [key, pane] of Object.entries(pages)) pane.hidden = key !== name;
+			for (const link of document.querySelectorAll('#tabmenu a[href]')) {
+				const page = paths.get(link.pathname);
+				if (!page) continue;
+				link.closest('li')?.classList.toggle('active', page === name);
+				if (page === name) link.setAttribute('aria-current', 'page');
+				else link.removeAttribute('aria-current');
+			}
+			pages[name].dispatchEvent(new CustomEvent('cbi-tab-active', { detail: { tab: name } }));
+		}
+		// Keep draft edits and in-flight measurements when switching the native menu links in this tab.
+		document.querySelector('#tabmenu')?.addEventListener('click', event => {
+			const link = event.target.closest('a[href]');
+			const name = link?.origin === location.origin && paths.get(link.pathname);
+			if (!name || event.button || event.altKey || event.ctrlKey || event.metaKey || event.shiftKey) return;
+			event.preventDefault();
+			openTab(name);
+		});
+		function showCurrentPage() {
+			openTab(paths.get(location.pathname.replace(/\/$/, '')) || 'service', false);
+		}
+		window.addEventListener('popstate', showCurrentPage);
+		goSpeed.addEventListener('click', function() {
+			openTab('speed');
+			speed.element.querySelector('[data-tab="speed-nodes"] > a')?.click();
+		});
+		goDevices.addEventListener('click', function() {
+			openTab('devices');
+			devices.openEditor();
+		});
+		manageDevices.addEventListener('click', () => openTab('devices'));
+		if (pending && L.hasViewPermission() !== false) this.restoreSettings();
+		updateDeviceOverview();
 		update(initial);
+		showCurrentPage();
 		poll.add(function() {
-			if (!updating && service.getAttribute('data-tab-active') === 'true')
-				return getStatus().then(function(data) { if (!updating) update(data); });
+			const snapshot = state;
+			if (!updating)
+				return getStatus().then(function(data) { if (!updating && state === snapshot) update(data); });
 		}, 10);
 		return app;
 	}

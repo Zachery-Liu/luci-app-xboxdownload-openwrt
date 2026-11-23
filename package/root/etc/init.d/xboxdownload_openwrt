@@ -7,10 +7,11 @@ USE_PROCD=1
 . /usr/share/xboxdownload_openwrt/common.sh
 
 write_dns() {
-	local host target key addresses value
+	local host target key addresses value dns6=0
+	case ",$ipv6_devices," in */dns,*) dns6=1 ;; esac
 	printf '%s\n' "port=$DNS_PORT" "listen-address=$lan_ip,127.0.0.1" \
 		"pid-file=$RUNDIR/dnsmasq.pid" 'no-resolv' 'cache-size=64' 'dns-forward-max=32'
-	if [ "$ipv6_dns" = 1 ]; then
+	if [ "$dns6" = 1 ]; then
 		printf '%s\n' "interface=$lan_dev" 'bind-dynamic'
 	else
 		printf '%s\n' 'bind-interfaces'
@@ -35,7 +36,7 @@ write_dns() {
 		if [ -z "$value" ] && [ "${mode:-redirect}" = redirect ]; then
 			value=$HTTP_ADDRESS
 			printf 'local=/%s/\n' "$host"
-		elif [ "$ipv6_dns" = 1 ] && [ -n "$value" ] && ipv4 "$value"; then
+		elif [ "$dns6" = 1 ] && [ -n "$value" ] && ipv4 "$value"; then
 			printf 'local=/%s/\n' "$host"
 		fi
 		[ -z "$value" ] || printf 'host-record=%s,%s\n' "$host" "$value"
@@ -51,7 +52,7 @@ write_dns() {
 		eval "value=\${$key}"
 		[ -n "$value" ] || continue
 		printf 'host-record=%s,%s\n' "$addresses" "$value"
-		if [ "$ipv6_dns" = 1 ] && ipv4 "$value"; then
+		if [ "$dns6" = 1 ] && ipv4 "$value"; then
 			printf 'local=/%s/\n' "$(printf '%s' "$addresses" | tr ',' '/')"
 		fi
 	done < "$DATA/cdn-hosts"
@@ -59,10 +60,10 @@ write_dns() {
 
 write_ipv6_dns_firewall() {
 	cat <<-EOF
-		table inet xboxdownload_openwrt_ipv6 {
+			set dns_clients { type ether_addr; elements = { $1 }; }
 			chain dns6_request_zone {
 				type filter hook prerouting priority raw; policy accept;
-				iifname "$lan_dev" ether saddr $ipv6_block_mac meta nfproto ipv6 meta l4proto { tcp, udp } th dport 53 fib daddr . iif type local ct zone set $DNS_ZONE
+				iifname "$lan_dev" ether saddr @dns_clients meta nfproto ipv6 meta l4proto { tcp, udp } th dport 53 fib daddr . iif type local ct zone set $DNS_ZONE
 			}
 			chain dns6_reply_zone {
 				type filter hook output priority raw; policy accept;
@@ -70,19 +71,32 @@ write_ipv6_dns_firewall() {
 			}
 			chain select_xbox_ipv6_dns {
 				type nat hook prerouting priority -101; policy accept;
-				iifname "$lan_dev" ether saddr $ipv6_block_mac meta nfproto ipv6 meta l4proto { tcp, udp } th dport 53 fib daddr . iif type local counter redirect to :$DNS_PORT
+				iifname "$lan_dev" ether saddr @dns_clients meta nfproto ipv6 meta l4proto { tcp, udp } th dport 53 fib daddr . iif type local counter redirect to :$DNS_PORT
 			}
 			chain restrict_dns6_port {
 				type filter hook input priority -1; policy accept;
-				iifname "$lan_dev" ether saddr $ipv6_block_mac meta nfproto ipv6 meta l4proto { tcp, udp } th dport $DNS_PORT ct status dnat accept
+				iifname "$lan_dev" ether saddr @dns_clients meta nfproto ipv6 meta l4proto { tcp, udp } th dport $DNS_PORT ct status dnat accept
 				iifname != "lo" meta nfproto ipv6 meta l4proto { tcp, udp } th dport $DNS_PORT drop
 			}
-		}
+	EOF
+}
+
+write_ipv6_block_firewall() {
+	cat <<-EOF
+			set blocked_clients { type ether_addr; elements = { $1 }; }
+			chain restrict_xbox_ipv6_dns {
+				type filter hook input priority -5; policy accept;
+				iifname "$lan_dev" ether saddr @blocked_clients meta nfproto ipv6 meta l4proto { tcp, udp } th dport 53 counter reject with icmpv6 type admin-prohibited
+			}
+			chain restrict_xbox_ipv6_forward {
+				type filter hook forward priority -5; policy accept;
+				iifname "$lan_dev" ether saddr @blocked_clients ip6 daddr 2000::/3 counter reject with icmpv6 type admin-prohibited
+			}
 	EOF
 }
 
 write_firewall() {
-	local http_rule= tcp_ports=$DNS_PORT
+	local http_rule= tcp_ports=$DNS_PORT dns_macs blocked_macs
 	if [ "${mode:-redirect}" = redirect ]; then
 		http_rule="iifname \"$lan_dev\" ip saddr { $client } ip daddr $HTTP_ADDRESS tcp dport 80 dnat to $lan_ip:$HTTP_PORT"
 		tcp_ports="$DNS_PORT, $HTTP_PORT"
@@ -111,27 +125,18 @@ write_firewall() {
 				ip daddr $lan_ip udp dport $DNS_PORT ct status dnat iifname "$lan_dev" ip saddr { $client } accept
 				ip daddr $lan_ip tcp dport { $tcp_ports } ct status dnat iifname "$lan_dev" ip saddr { $client } accept
 				ip daddr $lan_ip udp dport $DNS_PORT drop
-				ip daddr $lan_ip tcp dport { $tcp_ports } drop
+				# Router-originated health probes arrive over loopback.
+				iifname != "lo" ip daddr $lan_ip tcp dport { $tcp_ports } drop
 			}
 		}
 	EOF
-	if [ "$ipv6_dns" = 1 ]; then
-		write_ipv6_dns_firewall
-		return
-	fi
-	[ "$ipv6_block" = 1 ] || return 0
-	cat <<-EOF
-		table inet xboxdownload_openwrt_ipv6 {
-			chain restrict_xbox_ipv6_dns {
-				type filter hook input priority -5; policy accept;
-				iifname "$lan_dev" ether saddr $ipv6_block_mac meta nfproto ipv6 meta l4proto { tcp, udp } th dport 53 counter reject with icmpv6 type admin-prohibited
-			}
-			chain restrict_xbox_ipv6_forward {
-				type filter hook forward priority -5; policy accept;
-				iifname "$lan_dev" ether saddr $ipv6_block_mac ip6 daddr 2000::/3 counter reject with icmpv6 type admin-prohibited
-			}
-		}
-	EOF
+	dns_macs=$(ipv6_policy_macs dns)
+	blocked_macs=$(ipv6_policy_macs block)
+	[ -n "$dns_macs$blocked_macs" ] || return 0
+	printf '%s\n' 'table inet xboxdownload_openwrt_ipv6 {'
+	[ -z "$dns_macs" ] || write_ipv6_dns_firewall "$dns_macs"
+	[ -z "$blocked_macs" ] || write_ipv6_block_firewall "$blocked_macs"
+	printf '%s\n' '}'
 }
 
 report_error() {
@@ -150,12 +155,15 @@ start_service() {
 	lan_network || { report_error 'LAN IPv4 unavailable'; return 1; }
 	validation=$(validate_settings) || { report_error "Invalid settings: $validation"; return 1; }
 	client=$(normalize_clients "$client")
-	if [ "$ipv6_dns" = 1 ]; then
-		dns_ipv6=$(ip -6 addr show dev "$lan_dev" scope link |
-			awk '/inet6/ && !/tentative|dadfailed/ { split($2, address, "/"); print address[1]; exit }')
-		[ -n "$dns_ipv6" ] || { report_error 'LAN IPv6 unavailable'; return 1; }
-		dns_ipv6="[$dns_ipv6%$lan_dev]:$DNS_PORT"
-	fi
+	ipv6_devices=$(normalize_ipv6_devices "$ipv6_devices")
+	case ",$ipv6_devices," in
+		*/dns,*)
+			dns_ipv6=$(ip -6 addr show dev "$lan_dev" scope link |
+				awk '/inet6/ && !/tentative|dadfailed/ { split($2, address, "/"); print address[1]; exit }')
+			[ -n "$dns_ipv6" ] || { report_error 'LAN IPv6 unavailable'; return 1; }
+			dns_ipv6="[$dns_ipv6%$lan_dev]:$DNS_PORT"
+			;;
+	esac
 
 	if [ -n "$upstream" ]; then
 		write_upstream "$upstream" || { report_error 'Could not set DNS upstream'; return 1; }
@@ -182,10 +190,12 @@ start_service() {
 }
 
 stop_service() {
+	local stopped=0
 	lock "$SERVICE_LOCK" || return 1
-	rm -f "$RUNDIR/instance" "$RUNDIR/ready" "$RUNDIR/error" "$UPSTREAM_STATE"
-	clear_rules
-	lock -u "$SERVICE_LOCK"
+	rm -f "$RUNDIR/instance" "$RUNDIR/ready" "$RUNDIR/error" "$UPSTREAM_STATE" || stopped=1
+	clear_rules || stopped=1
+	lock -u "$SERVICE_LOCK" || stopped=1
+	return "$stopped"
 }
 
 reload_service() {

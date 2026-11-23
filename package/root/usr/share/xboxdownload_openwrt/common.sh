@@ -5,11 +5,14 @@ HTTP_PORT=18080
 HTTP_ADDRESS=192.0.0.8
 DNS_ZONE=53953
 HEALTH_HOST=xboxdownload-openwrt.invalid
+HTTP_HEALTH_ERROR='Could not verify HTTP 302 redirects'
+RULE_CLEANUP_ERROR='Could not remove interception rules'
 SERVICE_LOCK=/var/lock/xboxdownload_openwrt_service.lock
 UPSTREAM_FILE="$RUNDIR/upstreams.conf"
 UPSTREAM_STATE="$RUNDIR/upstream-state"
 NODE_KEYS="main_ip legacy_ip global_ip app_ip ps_ip ns_ip ea_ip battle_ip"
-EXTRA_KEYS="upstream global_ip app_ip ps_ip ns_ip ea_ip battle_ip mode filter_aaaa log_mode log_path ipv6_dns ipv6_block ipv6_block_ip ipv6_block_mac"
+LEGACY_IPV6_KEYS="ipv6_dns ipv6_block ipv6_block_ip ipv6_block_mac"
+EXTRA_KEYS="upstream global_ip app_ip ps_ip ns_ip ea_ip battle_ip mode filter_aaaa log_mode log_path ipv6_devices"
 SETTINGS_KEYS="enabled client main_ip legacy_ip $EXTRA_KEYS"
 
 write_upstream() {
@@ -89,22 +92,87 @@ normalize_clients() {
 	printf '%s' "$chosen"
 }
 
+legacy_ipv6_devices() {
+	local mode=system ip addresses rows= matched=0
+	case "$ipv6_dns:$ipv6_block" in
+		1:0) mode=dns ;;
+		0:1) mode=block ;;
+		0:0) ;;
+		*) return 1 ;;
+	esac
+	addresses=$(normalize_clients "$client") || return 1
+	for ip in $(printf '%s' "$addresses" | tr ',' ' '); do
+		if [ "$ip" = "$ipv6_block_ip" ] && [ "$mode" != system ]; then
+			rows="${rows:+$rows,}$ip/$ipv6_block_mac/$mode"
+			matched=1
+		else
+			rows="${rows:+$rows,}$ip//system"
+		fi
+	done
+	if [ "$matched" = 0 ] && [ "$mode" != system ] && [ -n "$ipv6_block_ip$ipv6_block_mac" ]; then
+		rows="${rows:+$rows,}$ipv6_block_ip/$ipv6_block_mac/$mode"
+	fi
+	printf '%s' "$rows"
+}
+
+normalize_ipv6_devices() {
+	local row ip rest mac policy rows= seen_ips= seen_macs=
+	case "$1" in
+		*[!0-9A-Za-z.:/,]*|,*|*,|*,,*) printf ipv6_device; return 1 ;;
+	esac
+	[ "${#1}" -le 400 ] || { printf ipv6_device; return 1; }
+	for row in $(printf '%s' "$1" | tr ',' ' '); do
+		case "$row" in */*/*) ;; *) printf ipv6_device; return 1 ;; esac
+		ip=${row%%/*}
+		rest=${row#*/}
+		mac=${rest%%/*}
+		policy=${rest#*/}
+		case ",$client," in *",$ip,"*) ;; *) printf ipv6_device; return 1 ;; esac
+		[ -n "$ip" ] || { printf ipv6_device; return 1; }
+		case ",$seen_ips," in *",$ip,"*) printf ipv6_device; return 1 ;; esac
+		case "$policy" in dns|block|system) ;; *) printf ipv6_device; return 1 ;; esac
+		if [ -n "$mac" ] || [ "$policy" != system ]; then
+			client_mac "$mac" || { printf ipv6_device; return 1; }
+			mac=$(printf '%s' "$mac" | tr 'a-f' 'A-F')
+			case ",$seen_macs," in *",$mac,"*) printf ipv6_mac_duplicate; return 1 ;; esac
+			seen_macs="${seen_macs:+$seen_macs,}$mac"
+		fi
+		seen_ips="${seen_ips:+$seen_ips,}$ip"
+		rows="${rows:+$rows,}$ip/$mac/$policy"
+	done
+	printf '%s' "$rows"
+}
+
+ipv6_policy_macs() {
+	printf '%s\n' "$ipv6_devices" | tr ',' '\n' | awk -F/ -v policy="$1" '
+		$3 == policy { printf "%s%s", separator, $2; separator=", " }'
+}
+
 load_settings() {
 	local key default
 	config_load xboxdownload_openwrt
-	for key in $SETTINGS_KEYS; do
+	legacy_ipv6_config=0
+	for key in $SETTINGS_KEYS $LEGACY_IPV6_KEYS; do
 		default=
 		case "$key" in
 			enabled|filter_aaaa|log_path|ipv6_dns|ipv6_block) default=0 ;;
 			mode) default=redirect ;;
 			log_mode) default=http ;;
+			ipv6_devices) default=legacy ;;
 		esac
 		config_get "$key" main "$key" "$default"
 	done
+	case "$ipv6_devices" in
+		none) ipv6_devices= ;;
+		legacy)
+			legacy_ipv6_config=1
+			ipv6_devices=$(legacy_ipv6_devices) || ipv6_devices=invalid
+			;;
+	esac
 }
 
 validate_settings() {
-	local key value
+	local key value normalized
 	case "$mode" in redirect|dns) ;; *) printf invalid; return 1 ;; esac
 	case "$log_mode" in off|http|all) ;; *) printf invalid; return 1 ;; esac
 	case "$enabled:$filter_aaaa:$log_path" in
@@ -112,23 +180,13 @@ validate_settings() {
 	esac
 	client=$(normalize_clients "$client") || { printf client; return 1; }
 	[ "$enabled" = 0 ] || [ -n "$client" ] || { printf client; return 1; }
-	case "${ipv6_block:-0}:${ipv6_dns:-0}" in
-		0:0) [ -z "$ipv6_block_ip$ipv6_block_mac" ] || { printf ipv6_device; return 1; } ;;
-		1:0|0:1)
-			if [ "$enabled:$ipv6_dns" != 0:1 ] || [ -n "$ipv6_block_ip$ipv6_block_mac" ]; then
-				client_ipv4 "$ipv6_block_ip" && client_mac "$ipv6_block_mac" ||
-					{ printf ipv6_device; return 1; }
-				case ",$client," in
-					*",$ipv6_block_ip,"*) ;;
-					*) printf ipv6_device; return 1 ;;
-				esac
-			fi
-			case "$ipv6_block:$main_ip,$legacy_ip,$global_ip" in
-				1:*:*) printf ipv6_cdn; return 1 ;;
-			esac
-			[ "$ipv6_dns:$filter_aaaa" != 1:1 ] || { printf ipv6_filter; return 1; }
-			;;
-		*) printf invalid; return 1 ;;
+	normalized=$(normalize_ipv6_devices "$ipv6_devices") || { printf '%s' "$normalized"; return 1; }
+	case ",$normalized," in
+		*/dns,*) [ "$filter_aaaa" = 0 ] || { printf ipv6_filter; return 1; } ;;
+	esac
+	case ",$normalized," in
+		*/block,*)
+			case "$main_ip,$legacy_ip,$global_ip" in *:*) printf ipv6_cdn; return 1 ;; esac ;;
 	esac
 	case "$upstream" in
 		'') ;;

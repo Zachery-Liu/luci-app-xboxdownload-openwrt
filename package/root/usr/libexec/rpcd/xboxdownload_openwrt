@@ -41,10 +41,18 @@ clear_logs() {
 }
 
 status() {
-	local key value routes wan6_state ipv6_block_active=0 ipv6_dns_active=0
+	local key value routes wan6_state lan_ipv6_dns= advertised_dns= ipv6_block_active=0 ipv6_dns_active=0
 	load_settings
 	lan_ip=
-	lan_network || true
+	lan_dev=
+	lan_network || network_get_device lan_dev lan || true
+	if [ -n "$lan_dev" ]; then
+		lan_ipv6_dns=$(ip -6 addr show dev "$lan_dev" 2>/dev/null |
+			awk '/^[[:space:]]*inet6 / && / scope (link|global)( |$)/ && !/temporary|tentative|dadfailed|deprecated/ {
+				split($2, address, "/"); print address[1]
+			}')
+		advertised_dns=$(uci -q get dhcp.lan.dns 2>/dev/null)
+	fi
 	services=$(ubus call service list '{"name":"xboxdownload_openwrt"}' 2>/dev/null) || services='{}'
 	service=$(jsonfilter -s "$services" -e '@.xboxdownload_openwrt.instances.service.running')
 	dns=false
@@ -65,10 +73,10 @@ status() {
 	else
 		wan6_state=unknown
 	fi
-	if [ "$ipv6_block" = 1 ] && nft list table inet xboxdownload_openwrt_ipv6 >/dev/null 2>&1; then
+	if nft list chain inet xboxdownload_openwrt_ipv6 restrict_xbox_ipv6_forward >/dev/null 2>&1; then
 		ipv6_block_active=1
 	fi
-	if [ "$ipv6_dns" = 1 ] && nft list chain inet xboxdownload_openwrt_ipv6 select_xbox_ipv6_dns >/dev/null 2>&1; then
+	if nft list chain inet xboxdownload_openwrt_ipv6 select_xbox_ipv6_dns >/dev/null 2>&1; then
 		ipv6_dns_active=1
 	fi
 
@@ -80,6 +88,8 @@ status() {
 	json_add_string wan6_state "$wan6_state"
 	json_add_boolean ipv6_block_active "$ipv6_block_active"
 	json_add_boolean ipv6_dns_active "$ipv6_dns_active"
+	json_add_string lan_ipv6_dns "$lan_ipv6_dns"
+	json_add_string lan_advertised_dns "$advertised_dns"
 	json_add_string upstream_state "$(cat "$UPSTREAM_STATE" 2>/dev/null)"
 	json_add_string router "$lan_ip"
 	for key in client main_ip legacy_ip $EXTRA_KEYS; do
@@ -96,6 +106,8 @@ write_settings() {
 	{
 		for key in $SETTINGS_KEYS; do
 			eval "value=\${$key}"
+			# Persist an explicit empty list so legacy policies cannot reappear.
+			[ "$key" != ipv6_devices ] || value=${value:-none}
 			printf "set xboxdownload_openwrt.main.%s='%s'\n" "$key" "$value"
 		done
 	} | uci -q batch && uci -q commit xboxdownload_openwrt
@@ -104,24 +116,50 @@ write_settings() {
 wait_for_service() {
 	local attempt
 	for attempt in 1 2 3 4 5 6 7 8 9 10; do
-		[ ! -s "$RUNDIR/ready" ] || return 0
+		if [ -s "$RUNDIR/ready" ] && cmp -s "$RUNDIR/ready" "$RUNDIR/instance"; then
+			return 0
+		fi
 		[ ! -s "$RUNDIR/error" ] || return 1
 		sleep 1
 	done
 	return 1
 }
 
+apply_service_state() {
+	local rules
+	if [ "$1" = 1 ]; then
+		"$INIT" restart >/dev/null 2>&1 && wait_for_service
+		return
+	fi
+	"$INIT" stop >/dev/null 2>&1 || return 1
+	[ ! -e "$RUNDIR/instance" ] && [ ! -e "$RUNDIR/ready" ] || return 1
+	rules=$(nft list tables 2>/dev/null) || return 1
+	! printf '%s\n' "$rules" | grep -Eq '^table (ip xboxdownload_openwrt|inet xboxdownload_openwrt_ipv6)$'
+}
+
 configure() {
-	local validation previous extra key type start_error
+	local validation previous previous_enabled extra key type apply_error rollback_error detail
 	lock /var/lock/xboxdownload_openwrt.lock || { result busy; return; }
 	trap 'lock -u /var/lock/xboxdownload_openwrt.lock' EXIT
 	load_settings
+	previous_enabled=$enabled
 	json_get_vars client main_ip legacy_ip enabled extra
 	if [ -n "$extra" ]; then
 		json_load "$extra" || { result invalid; return; }
-		# Earlier LuCI clients only send the IPv6 blocking setting.
-		if json_get_type type ipv6_block && ! json_get_type type ipv6_dns; then
-			ipv6_dns=0
+		# An older LuCI page must not overwrite a saved per-device configuration.
+		if ! json_get_type type ipv6_devices &&
+			{ json_get_type type ipv6_dns || json_get_type type ipv6_block; }; then
+			[ "$legacy_ipv6_config" = 1 ] || [ -z "$ipv6_devices" ] || { result ipv6_reload; return; }
+			if json_get_type type ipv6_block && ! json_get_type type ipv6_dns; then
+				ipv6_dns=0
+			fi
+			for key in $LEGACY_IPV6_KEYS; do
+				if json_get_type type "$key"; then
+					[ "$type" = string ] || { result invalid; return; }
+					json_get_var "$key" "$key"
+				fi
+			done
+			ipv6_devices=$(legacy_ipv6_devices) || { result ipv6_device; return; }
 		fi
 		for key in $EXTRA_KEYS; do
 			if json_get_type type "$key"; then
@@ -134,28 +172,43 @@ configure() {
 	lan_network || { [ "$enabled" != 1 ] || { result lan; return; }; }
 	validation=$(validate_settings) || { result "$validation"; return; }
 	client=$(normalize_clients "$client")
+	ipv6_devices=$(normalize_ipv6_devices "$ipv6_devices")
 	previous=$(uci -q export xboxdownload_openwrt) || { result save; return; }
 
-	if write_settings; then
-		if [ "$enabled" = 0 ]; then
-			"$INIT" stop >/dev/null 2>&1
-		elif ! "$INIT" restart >/dev/null 2>&1 || ! wait_for_service; then
-			start_error=start
-			if [ "$(cat "$RUNDIR/error" 2>/dev/null)" = 'Could not forward ordinary DNS queries' ]; then
-				start_error=dns_upstream
-			elif [ "$(cat "$RUNDIR/error" 2>/dev/null)" = 'LAN IPv6 unavailable' ]; then
-				start_error=lan_ipv6
-			fi
-			printf '%s\n' "$previous" | uci -q import xboxdownload_openwrt && uci -q commit xboxdownload_openwrt
-			"$INIT" restart >/dev/null 2>&1
-			result "$start_error"
-			return
-		fi
-		result ''
-	else
+	if ! write_settings; then
 		uci -q revert xboxdownload_openwrt
 		result save
+		return
 	fi
+	if apply_service_state "$enabled"; then
+		result ''
+		return
+	fi
+
+	apply_error=stop
+	if [ "$enabled" = 1 ]; then
+		case "$(cat "$RUNDIR/error" 2>/dev/null)" in
+			'Could not forward ordinary DNS queries') apply_error=dns_upstream ;;
+			'LAN IPv6 unavailable') apply_error=lan_ipv6 ;;
+			"$HTTP_HEALTH_ERROR") apply_error=http_redirect ;;
+			*) apply_error=start ;;
+		esac
+	fi
+	if printf '%s\n' "$previous" | uci -q import xboxdownload_openwrt &&
+		uci -q commit xboxdownload_openwrt && apply_service_state "$previous_enabled"; then
+		result "$apply_error"
+		return
+	fi
+
+	rollback_error=rollback
+	detail='Could not restore previous settings or service'
+	if ! apply_service_state 0; then
+		rollback_error=rollback_rules
+		detail='Could not restore previous settings or verify rule removal'
+	fi
+	mkdir -p "$RUNDIR" && printf '%s\n' "$detail" > "$RUNDIR/error"
+	logger -t xboxdownload_openwrt "$detail"
+	result "$rollback_error"
 }
 
 download_nodes() {

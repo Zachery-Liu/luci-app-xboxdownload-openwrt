@@ -1,6 +1,8 @@
 'use strict';
 'require baseclass';
+'require form';
 'require rpc';
+'require ui';
 
 const importNodes = rpc.declare({
 	object: 'xboxdownload_openwrt', method: 'import_nodes',
@@ -23,7 +25,7 @@ const sources = {
 const targets = {
 	main: ['Xbox cn1', 'assets1.xboxlive.cn / Xbox 测试文件', 'Xbox cn1 测试文件'],
 	legacy: ['Xbox cn2', 'dlassets.xboxlive.cn / Xbox One 游戏样本', 'Xbox One 游戏样本'],
-	global: ['Xbox COM', 'xvcf1.xboxlive.com / Xbox 测试文件', 'Xbox COM 测试文件'],
+	global: ['Xbox com', 'xvcf1.xboxlive.com / Xbox 测试文件', 'Xbox com 测试文件'],
 	app: ['Xbox 应用 / 微软商店', 'Microsoft Store CDN / 在线获取应用样本', '微软商店应用样本'],
 	ps: ['PlayStation', 'gst.prod.dl.playstation.net / PS 测试文件', 'PlayStation 测试文件'],
 	ns: ['Nintendo Switch', 'ctest-dl-lp1.cdn.nintendo.net / Switch 测试文件', 'Switch 测试文件'],
@@ -49,14 +51,18 @@ const carriers = {
 	移动: /移动|移動|Mobile/i
 };
 const pageSize = 24;
+const settingsKey = 'xboxdownload-openwrt.speed-settings';
 
 function button(label, style) {
-	return E('button', { class: 'btn' + (style ? ' ' + style : ''), type: 'button' }, [label]);
+	return E('button', { class: 'cbi-button' + (style ? ' ' + style : ''), type: 'button' }, [label]);
 }
 
 function select(label, options) {
-	return E('select', { class: 'cbi-input-select', 'aria-label': label }, options.map(
-		([value, name]) => E('option', { value: value }, [name])));
+	const widget = new ui.Select(options[0][0], Object.fromEntries(options), { sort: options.map(([key]) => key) });
+	const node = widget.render();
+	const input = node.querySelector('select');
+	input.setAttribute('aria-label', label);
+	return { node, input };
 }
 
 function addNode(nodes, ip, location) {
@@ -97,15 +103,13 @@ function speedText(result) {
 }
 
 return baseclass.extend({
-	render: function(applyNode, selectedNode) {
+	render: async function(selectNode, selectedNode) {
 		const lists = new Map();
-		const source = select('在线 IP 来源', Object.entries(sources).map(([key, data]) => [key, data[0]]));
+		const { node: sourceField, input: source } = select('在线 IP 来源', Object.entries(sources).map(([key, data]) => [key, data[0]]));
 		source.value = 'cn1';
-		const channel = select('导入渠道', [['auto', 'GitHub（失败时用 jsDelivr）'], ['mirror', 'jsDelivr']]);
-		const target = select('测速目标', Object.entries(targets).map(([key, data]) => [key, data[0]]));
-		target.value = sources[source.value][1];
-		const carrier = select('运营商', [['', '全部运营商'], ...Object.keys(carriers).map(name => [name, name])]);
-		const region = select('地区', [['', '全部地区'], ...regions.map(([name]) => [name, name]), ['other', '其他地区']]);
+		const { node: channelField, input: channel } = select('导入渠道', [['auto', 'GitHub（失败时用 jsDelivr）'], ['mirror', 'jsDelivr']]);
+		const { node: carrierField, input: carrier } = select('运营商', [['', '全部运营商'], ...Object.keys(carriers).map(name => [name, name])]);
+		const { node: regionField, input: region } = select('地区', [['', '全部地区'], ...regions.map(([name]) => [name, name]), ['other', '其他地区']]);
 		const query = E('input', {
 			type: 'search', 'aria-label': '搜索位置或 IP', class: 'cbi-input-text',
 			placeholder: '搜索位置或 IP'
@@ -126,28 +130,62 @@ return baseclass.extend({
 			placeholder: '粘贴 IPv4 或 IPv6，用空格、逗号或换行分隔。'
 		});
 		const add = button('添加 IP');
-		const sample = E('code', { style: 'overflow-wrap:anywhere' });
-		const file = select('测速文件', cn1Files);
-		const fileField = E('label', { class: 'xb-field' }, ['测速文件', file]);
-		const fixedFile = E('p', { class: 'xb-muted' }, ['测速文件 ', sample]);
-		const timeout = select('单节点超时', [['3', '超时 3 秒'], ['5', '超时 5 秒'], ['10', '超时 10 秒']]);
-		const limit = select('下载样本上限', [['auto', ''], ['1', '样本 1 MiB'], ['8', '样本 8 MiB'], ['32', '样本 32 MiB']]);
+		const sample = E('span', { class: 'xb-sample' });
 		const testDefault = button('测默认节点');
-		const test = button('开始测速', 'xb-primary');
+		const test = button('开始测速', 'cbi-button-action');
 		const stop = button('停止测速');
-		const best = button('', 'xb-primary');
+		const best = button('', 'cbi-button-apply');
 		const fastest = E('div');
 		const bestSummary = E('div', { class: 'xb-row xb-between xb-best', hidden: true }, [fastest, best]);
 		const progress = E('p', { class: 'xb-progress', role: 'status' });
 		let loading = false;
 		let testing = false;
-		let applying = '';
-		let failedApply = null;
 		let cancelled = false;
 		let page = 0;
 		let sort = '';
 		let direction = -1;
 		let firstVisit = true;
+
+		function draftSettings() {
+			return Object.fromEntries(Object.entries(settingsControls).map(([key, control]) => [key, control.value]));
+		}
+
+		function setDraftControls(settings) {
+			for (const [name, control] of Object.entries(settingsControls)) {
+				if (Array.from(control.options).some(option => option.value === settings?.[name]))
+					control.value = settings[name];
+			}
+		}
+
+		function restoreDraft(settings = activeSettings) {
+			setDraftControls(settings);
+			setTarget();
+			renderTable();
+		}
+
+		function settingsChanged(draft = draftSettings()) {
+			return Object.keys(settingsControls).some(key => draft[key] !== activeSettings[key]);
+		}
+
+		function applySettings(draft) {
+			if (!settingsChanged(draft)) {
+				renderTable();
+				return true;
+			}
+			activeSettings = draft;
+			progress.textContent = '';
+			resetPage();
+			try {
+				localStorage.setItem(settingsKey, JSON.stringify(draft));
+				return true;
+			} catch (error) {
+				return false;
+			}
+		}
+
+		function activeTarget() {
+			return sources[source.value][1] || activeSettings.target;
+		}
 
 		function current() {
 			if (!lists.has(source.value))
@@ -156,7 +194,8 @@ return baseclass.extend({
 		}
 
 		function measurementKey() {
-			return target.value === 'main' ? 'main:' + file.value : target.value;
+			const group = activeTarget();
+			return group === 'main' ? 'main:' + activeSettings.file : group;
 		}
 
 		function measurement(row) {
@@ -206,25 +245,22 @@ return baseclass.extend({
 			return { rows: rows.slice(page * pageSize, (page + 1) * pageSize), matches: rows, pages: pages };
 		}
 
-		function updateApplyButton(control, ip, saved, label, busy) {
-			const isSaved = !!ip && ip === saved.ip;
-			const failed = failedApply && failedApply.group === target.value && failedApply.ip === ip;
-			const text = applying && applying === ip ? '应用中…' :
-				isSaved ? saved.running ? '已应用' : '已保存' :
-				failed ? '应用失败 · 重试' : label;
+		function updateNodeButton(control, ip, selection, label, busy) {
+			const picked = !!ip && ip === selection.draft;
+			const text = picked ? ip !== selection.saved ? '待应用' : selection.running ? '已应用' : '已保存' : label;
 			control.textContent = text;
-			control.disabled = busy || !ip || isSaved;
-			control.title = isSaved && !saved.running ? '服务启动后生效' :
-				text === '应用' ? '应用到 ' + targets[target.value][0] : text;
-			control.setAttribute('aria-label', text === '应用' ? control.title : text);
+			control.disabled = busy || !ip || picked;
+			control.title = text === '已保存' ? '服务启动后生效' : text === '待应用' ? '保存并应用后生效' : text;
+			control.setAttribute('aria-label', text === '选用' ? '选用节点 ' + ip : text);
 		}
 
 		function refreshControls(rows, matchCount) {
-			const busy = testing || applying || loading;
+			const busy = testing || loading;
+			const group = activeTarget();
 			source.disabled = busy;
 			channel.disabled = busy;
-			carrier.hidden = akamaiSources.has(source.value);
-			region.hidden = !carrier.hidden;
+			carrierField.hidden = akamaiSources.has(source.value);
+			regionField.hidden = !carrierField.hidden;
 			target.disabled = busy || !!sources[source.value][1];
 			online.disabled = busy;
 			add.disabled = busy;
@@ -244,21 +280,20 @@ return baseclass.extend({
 					node && node.location ? E('span', { class: 'xb-muted' }, [node.location]) : '',
 					E('strong', { class: 'xb-rate' }, [speedText(fastestResult)])
 				);
-				updateApplyButton(best, fastestResult.ip, selectedNode(target.value),
-					'应用到 ' + targets[target.value][0], busy);
+				updateNodeButton(best, fastestResult.ip, selectedNode(group), '选用到 ' + targets[group][0], busy);
 			}
 			stop.disabled = !testing || cancelled;
 			stop.hidden = !testing;
 			selectPage.disabled = busy || !rows.some(row => row.ip);
 			selectAll.disabled = busy || matchCount === 0;
-			const filtered = query.value.trim() || (region.hidden ? carrier.value : region.value);
+			const filtered = query.value.trim() || (regionField.hidden ? carrier.value : region.value);
 			selectAll.textContent = (filtered ? '全选筛选结果' : '全选结果') + '（' + matchCount + '）';
 			clear.disabled = busy || current().selected.size === 0;
 			counter.textContent = '已选 ' + current().selected.size + ' 个节点';
-			const sampleName = target.value === 'main' && file.value !== 'default' ?
-				file.selectedOptions[0].textContent : targets[target.value][2];
+			const sampleName = group === 'main' && activeSettings.file !== 'default' ?
+				cn1Files.find(([id]) => id === activeSettings.file)[1] : targets[group][2];
 			settingsSummary.textContent = '测试样本：' + sampleName + ' · 样本大小 ' +
-				(limit.value === 'auto' ? defaultLimit() : limit.value) + ' MiB · 超时 ' + timeout.value + ' 秒';
+				(activeSettings.limit === 'auto' ? defaultLimit() : activeSettings.limit) + ' MiB · 超时 ' + activeSettings.timeout + ' 秒';
 		}
 
 		function bestResult() {
@@ -271,44 +306,24 @@ return baseclass.extend({
 			return bestNode;
 		}
 
-		async function useNode(result) {
-			if (!result || !result.ip || applying || testing || loading)
+		function useNode(ip) {
+			if (!ip || testing || loading)
 				return;
-			const group = target.value;
-			const ip = result.ip;
-			const name = targets[group][0];
-			applying = ip;
-			failedApply = null;
-			progress.textContent = '正在应用 ' + ip + ' 到 ' + name + '…';
+			selectNode(activeTarget(), ip);
 			renderTable();
-			try {
-				if (await applyNode(group, ip)) {
-					progress.textContent = selectedNode(group).running ? '已应用 ' + ip + ' 到 ' + name :
-						'已保存 ' + ip + ' 到 ' + name + '，服务启动后生效。';
-				} else {
-					failedApply = { group, ip };
-					progress.textContent = '未能确认 ' + ip + ' 已应用，请重试。';
-				}
-			} finally {
-				applying = '';
-				renderTable();
-			}
 		}
 
 		function renderTable() {
 			const { rows, matches, pages } = pageRows();
 			const matchCount = matches.length - Number(current().nodes.has(''));
-			const saved = selectedNode(target.value);
-			const busy = testing || applying || loading;
+			const selection = selectedNode(activeTarget());
+			const busy = testing || loading;
 			const headings = [
 				['选择'], ['节点', 'ip', 'location'], ['下载速度', 'speed'], ['TTL', 'ttl'], ['延迟', 'delay'], ['结果'], ['操作']
 			];
 			const header = headings.map(function([label, key, secondary]) {
-				const attributes = { class: 'th', scope: 'col' };
 				if (!key)
-					return E('th', attributes, [label]);
-				if (sort === key || sort === secondary)
-					attributes['aria-sort'] = direction > 0 ? 'ascending' : 'descending';
+					return label;
 				function sortButton(text, column) {
 					const link = button(text + (sort === column ? direction > 0 ? ' ↑' : ' ↓' : ''), 'xb-sort');
 					link.addEventListener('click', function() {
@@ -319,13 +334,13 @@ return baseclass.extend({
 					});
 					return link;
 				}
-				return E('th', attributes, [sortButton(label, key), secondary ? sortButton('地区', secondary) : '']);
+				return E('span', {}, [sortButton(label, key), secondary ? sortButton('地区', secondary) : '']);
 			});
 			const body = rows.map(function(row) {
 				const result = measurement(row);
 				const checkbox = E('input', { type: 'checkbox', 'aria-label': '选择 ' + row.ip });
 				checkbox.checked = current().selected.has(row.ip);
-				checkbox.disabled = testing || applying || loading;
+				checkbox.disabled = busy;
 				checkbox.addEventListener('change', function() {
 					if (checkbox.checked) current().selected.add(row.ip);
 					else current().selected.delete(row.ip);
@@ -333,14 +348,15 @@ return baseclass.extend({
 				});
 				const label = E('strong', { class: 'xb-ip', title: row.ip ? '双击测速' : '' }, [row.ip || (result && result.ip) || '默认节点']);
 				label.addEventListener('dblclick', function() { run([row.ip]); });
-				const actionIp = result && result.ok && result.ip || (row.ip === saved.ip ? row.ip : '');
+				const actionIp = result && result.ok && result.ip ||
+					(row.ip === selection.saved || row.ip === selection.draft ? row.ip : '');
 				const use = button('');
-				updateApplyButton(use, actionIp, saved, '应用', busy);
-				use.addEventListener('click', function() { useNode(result); });
+				updateNodeButton(use, actionIp, selection, '选用', busy);
+				use.addEventListener('click', function() { useNode(actionIp); });
 				const delay = result && result.delay != null ? result.delay + ' ms' : '';
 				const received = result && result.ok && result.exit === 28 ?
 					E('small', { class: 'xb-result-bytes xb-muted' }, ['实收 ' + (Number(result.bytes) / 1048576).toFixed(2) + ' MiB']) : '';
-				const values = [
+				return [
 					row.ip ? checkbox : '—',
 					E('div', { class: 'xb-node' }, [label, row.location ? E('small', { class: 'xb-muted' }, [row.location]) : '']),
 					E('div', {}, [
@@ -351,17 +367,19 @@ return baseclass.extend({
 					E('div', { class: result ? '' : 'xb-muted' }, [formatResult(result), received]),
 					actionIp ? use : '—'
 				];
-				return E('tr', { class: 'tr' }, values.map(value => E('td', { class: 'td' }, [value])));
 			});
 			const empty = current().nodes.size ? '当前筛选没有匹配的节点。' : '在线导入列表，或手动添加候选 IP。';
 			const scroll = list.scrollTop;
-			list.replaceChildren(E('table', { class: 'table xb-node-table' }, [
-				E('thead', {},
-					[E('tr', { class: 'tr table-titles' }, header)]),
-				E('tbody', {}, body.length ? body : [E('tr', { class: 'tr' }, [
-					E('td', { class: 'td', colspan: headings.length }, [empty])
-				])])
-			]));
+			const table = new ui.Table(header, { classes: ['xb-node-table'], sortable: false });
+			const tableNode = table.update(body, empty);
+			// Sort the complete filtered list before drawing the current page.
+			tableNode.querySelectorAll('th').forEach((th, index) => {
+				th.removeAttribute('data-sortable-row');
+				th.setAttribute('scope', 'col');
+				if (sort && headings[index].slice(1).includes(sort))
+					th.setAttribute('aria-sort', direction > 0 ? 'ascending' : 'descending');
+			});
+			list.replaceChildren(tableNode);
 			list.scrollTop = scroll;
 			pager.textContent = matches.length + ' 个节点 · ' + (page + 1) + ' / ' + pages + ' 页';
 			previous.disabled = page === 0;
@@ -370,7 +388,7 @@ return baseclass.extend({
 		}
 
 		async function loadList() {
-			if (loading || testing || applying)
+			if (loading || testing)
 				return;
 			const entry = current();
 			loading = true;
@@ -407,14 +425,14 @@ return baseclass.extend({
 		}
 
 		async function run(ips) {
-			if (testing || applying || loading || !ips.length)
+			if (testing || loading || !ips.length)
 				return;
 			const entry = current();
-			const group = target.value;
-			const testFile = group === 'main' ? file.value : '';
+			const group = activeTarget();
+			const testFile = group === 'main' ? activeSettings.file : '';
 			const key = measurementKey();
-			const seconds = Number(timeout.value);
-			const megabytes = limit.value === 'auto' ? defaultLimit() : Number(limit.value);
+			const seconds = Number(activeSettings.timeout);
+			const megabytes = activeSettings.limit === 'auto' ? defaultLimit() : Number(activeSettings.limit);
 			testing = true;
 			cancelled = false;
 			renderTable();
@@ -472,11 +490,12 @@ return baseclass.extend({
 		}
 
 		function setTarget() {
-			target.closest('.xb-field').hidden = !!sources[source.value][1];
-			fileField.hidden = target.value !== 'main';
-			fixedFile.hidden = target.value === 'main';
+			const group = sources[source.value][1] || target.value;
+			targetField.hidden = !!sources[source.value][1];
+			fileField.hidden = group !== 'main';
+			fixedFile.hidden = group === 'main';
 			limit.options[0].textContent = '原版样本 ' + defaultLimit() + ' MiB';
-			sample.textContent = targets[target.value][1];
+			sample.textContent = targets[group][1];
 		}
 
 		function resetPage() { page = 0; list.scrollTop = 0; renderTable(); }
@@ -488,15 +507,10 @@ return baseclass.extend({
 			region.value = '';
 			sort = '';
 			progress.textContent = '';
-			target.value = sources[source.value][1] || 'global';
 			setTarget();
 			resetPage();
 			loadList();
 		});
-		target.addEventListener('change', function() { progress.textContent = ''; setTarget(); resetPage(); });
-		file.addEventListener('change', function() { progress.textContent = ''; resetPage(); });
-		timeout.addEventListener('change', renderTable);
-		limit.addEventListener('change', renderTable);
 		carrier.addEventListener('change', resetPage);
 		region.addEventListener('change', resetPage);
 		query.addEventListener('input', resetPage);
@@ -531,41 +545,63 @@ return baseclass.extend({
 		});
 		test.addEventListener('click', function() { run(Array.from(current().selected)); });
 		testDefault.addEventListener('click', function() { run(['']); });
-		best.addEventListener('click', function() { useNode(bestResult()); });
+		best.addEventListener('click', function() { useNode(bestResult()?.ip); });
 		stop.addEventListener('click', function() {
 			cancelled = true;
 			stop.disabled = true;
 			progress.textContent = '当前节点结束后停止。';
 		});
 
-		const panel = E('div', { 'data-tab': 'speed', 'data-tab-title': '测速' }, [
-			E('section', { class: 'xb-section xb-speed-controls' }, [
-				E('div', { class: 'xb-row' }, [source, channel, online, importState]),
-				E('div', { class: 'xb-row' }, [query, carrier, region, selectPage, selectAll, clear]),
+		const nodes = E('div', {}, [
+			E('div', { class: 'xb-speed-controls' }, [
+				E('div', { class: 'xb-row' }, [sourceField, channelField, online, importState]),
+				E('div', { class: 'xb-row' }, [query, carrierField, regionField, selectPage, selectAll, clear]),
 				E('div', { class: 'xb-row xb-between xb-test-bar' }, [
 					E('div', { class: 'xb-row' }, [counter, settingsSummary]),
 					E('div', { class: 'xb-row' }, [test, stop, testDefault])
 				]),
-				E('div', { class: 'xb-row xb-speed-options' }, [
-					E('details', { class: 'xb-details' }, [E('summary', {}, ['测速设置']),
-						E('div', { class: 'xb-fields' }, [
-							E('label', { class: 'xb-field' }, ['测速目标', target]),
-							fileField,
-							E('label', { class: 'xb-field' }, ['样本大小', limit]),
-							E('label', { class: 'xb-field' }, ['单节点超时', timeout])
-						]),
-						fixedFile
-					]),
-					E('details', { class: 'xb-details' }, [E('summary', {}, ['手动添加 IP']), E('div', { class: 'xb-row' }, [manual, add])])
+				E('details', { class: 'xb-details' }, [E('summary', {}, ['手动添加 IP']),
+					E('div', { class: 'xb-row' }, [manual, add])
 				]),
 				progress
 			]),
-			bestSummary,
-			E('section', { class: 'xb-section xb-results' }, [
-				list, E('div', { class: 'xb-row xb-paging' }, [previous, next, pager])
-			])
+			bestSummary, list,
+			E('div', { class: 'xb-row xb-paging' }, [previous, next, pager])
 		]);
-		panel.addEventListener('cbi-tab-active', function() {
+		const map = new form.JSONMap({ speed: {} });
+		const section = map.section(form.NamedSection, 'speed', 'speed');
+		section.tab('speed-nodes', '节点测速');
+		section.tab('speed-settings', '测速设置');
+		section.taboption('speed-nodes', form.DummyValue, '_nodes').render = () => nodes;
+		function preference(key, label, choices) {
+			const field = section.taboption('speed-settings', form.ListValue, key, label);
+			for (const [value, text] of choices) field.value(value, text);
+			return field;
+		}
+		const targetOption = preference('target', '测速目标', Object.entries(targets).map(([key, data]) => [key, data[0]]));
+		targetOption.default = 'global';
+		const fileOption = preference('file', '测速文件', cn1Files);
+		section.taboption('speed-settings', form.DummyValue, 'fixed_file', '测速文件').renderWidget = () => sample;
+		const limitOption = preference('limit', '样本大小', [['auto', '原版样本'], ['1', '样本 1 MiB'], ['8', '样本 8 MiB'], ['32', '样本 32 MiB']]);
+		const timeoutOption = preference('timeout', '单节点超时', [['3', '超时 3 秒'], ['5', '超时 5 秒'], ['10', '超时 10 秒']]);
+		const settingsForm = await map.render();
+		const control = option => option.getUIElement('speed').node.querySelector('select');
+		const target = control(targetOption);
+		const file = control(fileOption);
+		const limit = control(limitOption);
+		const timeout = control(timeoutOption);
+		const targetField = target.closest('.cbi-value');
+		const fileField = file.closest('.cbi-value');
+		const fixedFile = sample.closest('.cbi-value');
+		const settingsControls = { target, file, timeout, limit };
+		let stored;
+		try { stored = JSON.parse(localStorage.getItem(settingsKey)); } catch (error) { /* Use defaults. */ }
+		setDraftControls(stored);
+		let activeSettings = draftSettings();
+		target.addEventListener('change', setTarget);
+
+		settingsForm.addEventListener('cbi-tab-active', function(event) {
+			if (event.target !== settingsForm) return;
 			if (firstVisit) {
 				firstVisit = false;
 				loadList();
@@ -575,6 +611,6 @@ return baseclass.extend({
 		});
 		setTarget();
 		renderTable();
-		return panel;
+		return { element: settingsForm, refresh: renderTable, draftSettings, restoreDraft, settingsChanged, applySettings };
 	}
 });

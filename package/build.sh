@@ -12,12 +12,25 @@ if [ "$(id -u)" -ne 0 ]; then
 fi
 project=$(CDPATH='' cd -- "$(dirname -- "$0")/.." && pwd)
 name=luci-app-xboxdownload-openwrt
-version=0.8.0-r7
+version=1.0.0-r1
 stage=$(mktemp -d)
 trap 'rm -rf "$stage"' EXIT
 
 mkdir -p "$project/dist" "$stage/lib/apk/packages" "$stage/lib/upgrade/keep.d"
 cp -R "$project/package/root/." "$stage/"
+
+# LuCI's resource version tracks LuCI itself. Give plugin assets fresh URLs when their content changes.
+resources="$stage/www/luci-static/resources"
+assets=xboxdownload_openwrt
+asset_hash=$(cd "$resources" && sha256sum "view/$assets.js" "$assets"/*.js "$assets/style.css" | sha256sum)
+asset_path="${assets}_$(printf '%s' "$asset_hash" | cut -c1-12)"
+sed -e "s/'require $assets\./'require $asset_path./" -e "s|'$assets/|'$asset_path/|" \
+	"$resources/view/$assets.js" > "$resources/view/$asset_path.js"
+rm "$resources/view/$assets.js"
+mv "$resources/$assets" "$resources/$asset_path"
+sed -i "s/\"path\": \"$assets\"/\"path\": \"$asset_path\"/" \
+	"$stage/usr/share/luci/menu.d/luci-app-$assets.json"
+
 find "$stage" -type d -exec chmod 0755 {} +
 find "$stage" -type f -exec chmod 0644 {} +
 chmod 0755 "$stage/etc/init.d/xboxdownload_openwrt" "$stage/usr/libexec/rpcd/xboxdownload_openwrt" \

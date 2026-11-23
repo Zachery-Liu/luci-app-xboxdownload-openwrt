@@ -28,7 +28,9 @@ log_path=0
 if [ -r /var/run/xboxdownload_openwrt/http-log ]; then
 	read -r log_mode log_path < /var/run/xboxdownload_openwrt/http-log
 fi
-if [ "$log_mode" != off ]; then
+# Keep the supervisor's local probe out of the device's download log.
+if [ "$log_mode" != off ] && { [ "$REMOTE_ADDR" != "$SERVER_ADDR" ] ||
+	[ "$REQUEST_URI" != '/__xboxdownload_openwrt_health?probe=302&path=%2F' ]; }; then
 	details="$host -> $target"
 	if [ "$log_path" = 1 ]; then
 		path=$(printf '%s' "${REQUEST_URI%%\?*}" | LC_ALL=C cut -c 1-160)

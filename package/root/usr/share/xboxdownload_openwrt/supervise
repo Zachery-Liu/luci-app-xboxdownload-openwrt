@@ -25,7 +25,7 @@ cleanup() {
 	if lock "$SERVICE_LOCK"; then
 		if current_instance; then
 			rm -f "$RUNDIR/ready" "$UPSTREAM_STATE"
-			clear_rules
+			clear_rules || failure=$RULE_CLEANUP_ERROR
 			printf '%s\n' "$failure" > "$RUNDIR/error"
 			logger -t xboxdownload_openwrt "$failure"
 		fi
@@ -72,21 +72,42 @@ forwarding_ready() {
 	return 1
 }
 
-switch_upstream() {
-	local next=$lan_ip pid switched=1
-	[ "$preferred_upstream" != "$lan_ip" ] || return 1
-	[ "$active_upstream" != "$lan_ip" ] || next=$preferred_upstream
-	forwarding_ready "$next" || return 1
+reload_upstream() {
+	local next=$1 pid switched=1
 	lock "$SERVICE_LOCK" || return 1
 	pid=$(cat "$RUNDIR/dnsmasq.pid" 2>/dev/null)
-	if current_instance && [ -n "$pid" ] && write_upstream "$next" && kill -HUP "$pid" 2>/dev/null; then
-		active_upstream=$next
-		active_upstream_state=normal
-		[ "$next" != "$lan_ip" ] || active_upstream_state=fallback
-		switched=0
+	if current_instance && [ -n "$pid" ] && write_upstream "$next"; then
+		if kill -HUP "$pid" 2>/dev/null; then
+			active_upstream=$next
+			active_upstream_state=normal
+			[ "$next" = "$preferred_upstream" ] || active_upstream_state=fallback
+			switched=0
+		else
+			write_upstream "$active_upstream"
+		fi
 	fi
 	lock -u "$SERVICE_LOCK"
 	[ "$switched" -eq 0 ]
+}
+
+switch_upstream() {
+	local previous=$active_upstream
+	reload_upstream "$1" || return 1
+	# dnsmasq reloads servers-file asynchronously after SIGHUP.
+	sleep 1
+	forwarding_ready "$local_dns" && return 0
+	if ! reload_upstream "$previous"; then
+		failure='Could not set DNS upstream'
+		exit 1
+	fi
+	return 1
+}
+
+switch_to_alternate() {
+	local next=$lan_ip
+	[ "$preferred_upstream" != "$lan_ip" ] || return 1
+	[ "$active_upstream" != "$lan_ip" ] || next=$preferred_upstream
+	forwarding_ready "$next" && switch_upstream "$next"
 }
 
 publish_upstream_state() {
@@ -105,23 +126,47 @@ publish_upstream_state() {
 	lock -u "$SERVICE_LOCK"
 }
 
-monitor_upstream() {
-	local failures=0
+monitor_services() {
+	local failures=0 http_failures=0 recoveries=0 retry_delay=0
 	while current_instance; do
 		sleep 30 &
 		timer_pid=$!
 		wait "$timer_pid"
 		timer_pid=
 		current_instance || return
+		if http_ready; then
+			http_failures=0
+		else
+			http_failures=$((http_failures + 1))
+			if [ "$http_failures" -ge 2 ]; then
+				failure=$HTTP_HEALTH_ERROR
+				return 1
+			fi
+		fi
 		if forwarding_ready "$local_dns"; then
 			failures=0
+			if [ "$active_upstream_state" = fallback ]; then
+				if [ "$retry_delay" -gt 0 ]; then
+					retry_delay=$((retry_delay - 1))
+				elif forwarding_ready "$preferred_upstream"; then
+					recoveries=$((recoveries + 1))
+					if [ "$recoveries" -ge 2 ]; then
+						recoveries=0
+						switch_upstream "$preferred_upstream" || retry_delay=2
+					fi
+				else
+					recoveries=0
+				fi
+			fi
 			publish_upstream_state "$active_upstream_state"
 			continue
 		fi
+		recoveries=0
 		failures=$((failures + 1))
 		[ "$failures" -ge 2 ] || continue
-		if switch_upstream && forwarding_ready "$local_dns"; then
+		if switch_to_alternate; then
 			failures=0
+			retry_delay=0
 			publish_upstream_state "$active_upstream_state"
 		else
 			publish_upstream_state unavailable
@@ -129,10 +174,36 @@ monitor_upstream() {
 	done
 }
 
+read_http_response() {
+	local connection deadline
+	# The OpenWrt BusyBox nc applet has no timeout option.
+	/bin/busybox nc "$lan_ip" "$HTTP_PORT" <&3 2>/dev/null &
+	connection=$!
+	(sleep 1; kill "$connection") >/dev/null 2>&1 &
+	deadline=$!
+	wait "$connection" 2>/dev/null
+	kill "$deadline" 2>/dev/null
+	wait "$deadline" 2>/dev/null
+}
+
 http_ready() {
+	local path='/__xboxdownload_openwrt_health?probe=302&path=%2F'
 	[ "$mode" = dns ] && return 0
-	kill -0 "$http_pid" 2>/dev/null && [ "$(uclient-fetch --no-proxy -q -T 1 -O - \
-		"http://$lan_ip:$HTTP_PORT/health.txt" 2>/dev/null)" = xboxdownload-openwrt ]
+	kill -0 "$http_pid" 2>/dev/null || return 1
+	{
+		printf 'GET %s HTTP/1.1\r\nHost: assets1.xboxlive.com\r\nConnection: close\r\n\r\n' "$path"
+		# Keep stdin open while the minimal nc applet receives the response.
+		sleep 1
+	} | read_http_response 3<&0 |
+		awk -v expected="http://assets1.xboxlive.cn$path" '
+			{ sub(/\r$/, "") }
+			NR == 1 { status = ($1 ~ /^HTTP\/1\.[01]$/ && $2 == 302) }
+			tolower($0) ~ /^location:/ {
+				location = $0
+				sub(/^[^:]+:[ \t]*/, "", location)
+			}
+			$0 == "" { complete = 1; exit }
+			END { exit !(status && complete && location == expected) }'
 }
 
 lock "$SERVICE_LOCK" || exit 1
@@ -142,7 +213,11 @@ if ! current_instance; then
 fi
 # Also remove rules left by a killed supervisor before attempting its restart.
 rm -f "$RUNDIR/ready" "$UPSTREAM_STATE"
-clear_rules
+if ! clear_rules; then
+	printf '%s\n' "$RULE_CLEANUP_ERROR" > "$RUNDIR/error"
+	lock -u "$SERVICE_LOCK"
+	exit 1
+fi
 if [ -n "$configured_upstream" ] && ! write_upstream "$configured_upstream"; then
 	printf '%s\n' 'Could not set DNS upstream' > "$RUNDIR/error"
 	lock -u "$SERVICE_LOCK"
@@ -166,7 +241,7 @@ for attempt in 1 2 3; do
 	[ -z "$listener_error" ] || exit 1
 	failure="Could not start or verify DNS on port $DNS_PORT"
 	if dns_ready; then
-		failure="Could not start or verify HTTP on port $HTTP_PORT"
+		failure=$HTTP_HEALTH_ERROR
 		http_ready && break
 	fi
 	[ "$attempt" != 3 ] || exit 1
@@ -175,7 +250,7 @@ done
 
 failure='Could not forward ordinary DNS queries'
 if ! forwarding_ready "$local_dns"; then
-	switch_upstream && forwarding_ready "$local_dns" || exit 1
+	switch_to_alternate || exit 1
 fi
 
 # Hold the lifecycle lock so a concurrent stop cannot leave new rules behind.
@@ -201,5 +276,5 @@ trap 'exit 1' USR1 USR2
 last_upstream_state=normal
 publish_upstream_state "$active_upstream_state"
 # The listener watchers still interrupt the supervisor immediately on exit.
-monitor_upstream
+monitor_services
 exit 1
