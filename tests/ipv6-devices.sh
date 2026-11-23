@@ -226,6 +226,14 @@ expect 192.0.0.8 "$second" @fd10::1 assets1.xboxlive.com A +tcp
 expect 2001:db8:4::40 "$second" @fd10::1 ordinary.test AAAA
 expect 192.0.0.8 "$blocked" @192.0.2.1 assets1.xboxlive.com A
 expect 192.0.0.8 "$other" @192.0.2.1 assets1.xboxlive.com A
+nsenter -t "$xbox" -n ip link set peer address 02:00:00:00:00:67
+ip neigh replace 192.0.2.2 lladdr 02:00:00:00:00:67 nud permanent dev br-xbtest
+expect 203.0.113.50 "$xbox" -b '192.0.2.2#52982' @192.0.2.1 assets1.xboxlive.com A
+expect 203.0.113.50 "$xbox" -b '192.0.2.2#52983' @192.0.2.1 assets1.xboxlive.com A +tcp
+nsenter -t "$xbox" -n ip link set peer address 02:00:00:00:00:56
+ip neigh replace 192.0.2.2 lladdr 02:00:00:00:00:56 nud permanent dev br-xbtest
+expect 192.0.0.8 "$xbox" -b '192.0.2.2#52984' @192.0.2.1 assets1.xboxlive.com A
+echo 'PASS: IPv4 DNS bypasses the plugin when the saved address has a different MAC'
 if nsenter -t "$blocked" -n dig +tries=1 +time=1 @fd10::1 ordinary.test A >/dev/null 2>&1 ||
 	nsenter -t "$blocked" -n ping -6 -c 1 -W 1 2001:db8:2::2 >/dev/null 2>&1; then
 	echo 'IPv6 blocking failed for the selected device' >&2

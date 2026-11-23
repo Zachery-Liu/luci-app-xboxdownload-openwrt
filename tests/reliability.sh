@@ -65,7 +65,7 @@ launch_dns() {
 
 launch_supervisor() {
 	printf '%s\n' "$1" > "$run/instance"
-	chroot "$root" "$DATA_PATH/supervise" "$1" 192.0.2.1 redirect 192.0.2.9 &
+	chroot "$root" "$DATA_PATH/supervise" "$1" 192.0.2.1 redirect 192.0.2.9 '' "${2:-}" &
 	supervisor=$!
 	children="$children $supervisor"
 }
@@ -94,6 +94,21 @@ kill "$supervisor" "$negative_dns"
 wait "$supervisor"
 wait "$negative_dns"
 echo 'PASS: local NXDOMAIN responses alone cannot keep DNS on the broken upstream'
+
+chroot "$root" /usr/sbin/dnsmasq -k -C /dev/null --no-resolv --bind-interfaces \
+	--listen-address=192.0.2.9 --local=/com/net/ \
+	--host-record=probe.example.test,203.0.113.20 --address=/ordinary.test/203.0.113.20 \
+	--pid-file=/tmp/custom-probe.pid &
+custom_dns=$!
+children="$children $custom_dns"
+sleep 0.2
+launch_supervisor custom-probe probe.example.test
+wait_value "$run/ready" custom-probe
+[ "$(query custom.ordinary.test)" = 203.0.113.20 ]
+kill "$supervisor" "$custom_dns"
+wait "$supervisor"
+wait "$custom_dns"
+echo 'PASS: a custom hostname works when the default DNS probe names are blocked'
 
 launch_dns 192.0.2.9 203.0.113.20
 preferred_dns=$dns

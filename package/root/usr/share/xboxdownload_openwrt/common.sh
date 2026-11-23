@@ -12,7 +12,7 @@ UPSTREAM_FILE="$RUNDIR/upstreams.conf"
 UPSTREAM_STATE="$RUNDIR/upstream-state"
 NODE_KEYS="main_ip legacy_ip global_ip app_ip ps_ip ns_ip ea_ip battle_ip"
 LEGACY_IPV6_KEYS="ipv6_dns ipv6_block ipv6_block_ip ipv6_block_mac"
-EXTRA_KEYS="upstream global_ip app_ip ps_ip ns_ip ea_ip battle_ip mode filter_aaaa log_mode log_path ipv6_devices"
+EXTRA_KEYS="upstream probe_domain global_ip app_ip ps_ip ns_ip ea_ip battle_ip mode filter_aaaa log_mode log_path ipv6_devices"
 SETTINGS_KEYS="enabled client main_ip legacy_ip $EXTRA_KEYS"
 
 write_upstream() {
@@ -189,6 +189,13 @@ validate_settings() {
 		*:*) public_ipv6 "$upstream" || { printf upstream; return 1; } ;;
 		*) client_ipv4 "$upstream" || { printf upstream; return 1; } ;;
 	esac
+	if [ -n "$probe_domain" ]; then
+		local domain=${probe_domain%.}
+		[ "${#domain}" -le 253 ] && printf '%s\n' "$domain" | LC_ALL=C awk -F. '
+			NR != 1 || NF < 2 || $NF !~ /[A-Za-z]/ { bad = 1 }
+			{ for (i = 1; i <= NF; i++) if (length($i) > 63 || $i !~ /^[A-Za-z0-9]([A-Za-z0-9-]*[A-Za-z0-9])?$/) bad = 1 }
+			END { exit (NR != 1 || bad) }' || { printf probe_domain; return 1; }
+	fi
 	for key in $NODE_KEYS; do
 		eval "value=\${$key}"
 		[ -z "$value" ] && continue

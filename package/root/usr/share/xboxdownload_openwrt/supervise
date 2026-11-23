@@ -11,6 +11,7 @@ active_upstream=$preferred_upstream
 active_upstream_state=normal
 local_dns="127.0.0.1:$DNS_PORT"
 local_dns6=${5:-}
+probe_domain=${6:-}
 supervisor_pid=$$
 failure='A download service stopped; system DNS restored'
 
@@ -73,6 +74,13 @@ public_dns_answer() {
 
 forwarding_ready() {
 	local host
+	if [ -n "$probe_domain" ]; then
+		host="${probe_domain%.}."
+		if public_dns_answer "$host" "$1"; then
+			forwarding_host=$host
+			return 0
+		fi
+	fi
 	# Accept a public A answer from any of several independent DNS zones.
 	for host in www.baidu.com. www.microsoft.com. www.cloudflare.com.; do
 		if public_dns_answer "$host" "$1"; then

@@ -14,7 +14,7 @@ const configure = rpc.declare({
 	params: ['client', 'main_ip', 'legacy_ip', 'enabled', 'extra'], reject: true
 });
 const clearLogs = rpc.declare({ object: 'xboxdownload_openwrt', method: 'clear_logs', expect: { '': {} } });
-const extraKeys = ['upstream', 'global_ip', 'app_ip', 'ps_ip', 'ns_ip', 'ea_ip', 'battle_ip',
+const extraKeys = ['upstream', 'probe_domain', 'global_ip', 'app_ip', 'ps_ip', 'ns_ip', 'ea_ip', 'battle_ip',
 	'mode', 'filter_aaaa', 'log_mode', 'log_path', 'ipv6_devices'];
 const pendingKey = 'xboxdownload-openwrt.pending-settings';
 const viewPath = 'admin/services/xboxdownload_openwrt';
@@ -23,6 +23,7 @@ const errors = {
 	client: '请输入 1–8 个局域网设备 IPv4 地址，并确保它们和路由器地址不同。',
 	cdn: 'CDN 节点必须是公网 IPv4 或 IPv6 地址。',
 	upstream: '上游 DNS 必须是有效 IP 地址。',
+	probe_domain: '请输入有效的探测域名，例如 dns.example.com。',
 	ipv6: '已配置 IPv6 CDN 节点，请先关闭 AAAA 过滤。',
 	ipv6_device: '请检查加速设备的 IPv4 与 IPv6 策略。接管 DNS 或关闭公网 IPv6 时，需要填写设备的 MAC 地址。',
 	ipv6_mac_duplicate: '同一个 MAC 地址只能配置一次 IPv6 策略，请检查加速设备列表。',
@@ -97,7 +98,7 @@ function sameSetting(key, first, second) {
 	second ??= settingDefaults[key] || '';
 	if (key === 'client') return normalizeClients(first) === normalizeClients(second);
 	if (key === 'ipv6_devices') {
-		const active = value => value.toUpperCase().split(',').filter(row => !row.endsWith('/SYSTEM')).sort().join(',');
+		const active = value => value.toUpperCase().split(',').filter(row => !row.endsWith('//SYSTEM')).sort().join(',');
 		return active(first) === active(second);
 	}
 	return first === second;
@@ -160,6 +161,8 @@ return view.extend({
 			option(downloads, form.Value, key, label).placeholder = '自动解析';
 		}
 		option(downloads, form.Value, 'upstream', '上游 DNS').placeholder = '使用路由器现有 DNS';
+		option(downloads, form.Value, 'probe_domain', 'DNS 探测域名',
+			'可填写一个本网络允许解析且返回公网 IPv4 的域名。插件优先查询它，失败时再使用内置探针。').placeholder = '使用内置探针';
 		option(downloads, form.Flag, 'filter_aaaa', '过滤已选设备的 AAAA 应答',
 			'移除插件 DNS 应答中的 IPv6 地址，普通域名也受影响。使用「保留 IPv6，接管 DNS」时请保持关闭。');
 		logSettings.tab('recent-logs', '最近日志');
@@ -251,7 +254,7 @@ return view.extend({
 			status.dataset.state = data.running ? 'running' : data.enabled ? 'pending' : 'stopped';
 			const upstreamNotice = {
 				fallback: '自定义上游 DNS 无响应，普通域名已切回系统 DNS，下载加速继续运行。',
-				unavailable: 'DNS 上游无响应，普通域名可能无法解析。已配置的下载规则继续生效。'
+				unavailable: '无法验证上游 DNS 转发。请检查 DNS 或更换探测域名。已配置的下载规则继续生效。'
 			};
 			const notice = data.error ? serviceErrors[data.error] || data.error :
 				!data.router ? '路由器的 LAN 接口没有可用的 IPv4 地址。' :

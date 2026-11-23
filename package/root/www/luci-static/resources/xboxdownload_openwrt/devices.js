@@ -123,7 +123,12 @@ return baseclass.extend({
 					entries.delete(ip);
 					draw();
 				});
-				return [device?.name || '未命名设备', ip, profile.mac || device?.mac || '—', modes[profile.mode],
+				const moved = profile.mac && device?.mac !== profile.mac &&
+					Array.from(discovered).find(([address, item]) => address !== ip && item.mac === profile.mac)?.[0];
+				const conflict = profile.mac && device?.mac && device.mac !== profile.mac;
+				const address = moved ? E('span', {}, [ip, E('small', { class: 'xb-node' }, ['发现新地址 ' + moved + '，请编辑设备'])]) :
+					conflict ? E('span', {}, [ip, E('small', { class: 'xb-node' }, ['MAC 不匹配，已跳过 IPv4 接管'])]) : ip;
+				return [device?.name || '未命名设备', address, profile.mac || device?.mac || '—', modes[profile.mode],
 					E('div', { class: 'xb-row' }, [edit, remove])];
 			});
 			table.update(rows, '尚未添加设备。').querySelectorAll('th[data-sortable-row]')
@@ -166,8 +171,6 @@ return baseclass.extend({
 			for (const [value, label] of Object.entries(modes)) modeOption.value(value, label);
 			const macOption = section.option(form.Value, 'mac', 'MAC 地址');
 			macOption.placeholder = 'AA:BB:CC:DD:EE:FF';
-			macOption.depends('mode', 'dns');
-			macOption.depends('mode', 'block');
 
 			const body = await map.render();
 			body.classList.add('xb-device-editor');
@@ -214,7 +217,7 @@ return baseclass.extend({
 				const ip = address.value.trim(), device = discovered.get(ip);
 				const reports = [];
 				const typedMac = mac.value.trim().replace(/-/g, ':').toUpperCase();
-				if (mode.value !== 'system' && device && typedMac && typedMac !== device.mac)
+				if (device && typedMac && typedMac !== device.mac)
 					reports.push('路由器记录的 MAC 为 ' + device.mac + '，请确认设备。');
 				const ipv6 = device?.ipv6.find(value => /^[23][0-9a-f]{3}:/i.test(value)) || device?.ipv6[0];
 				address6.value = ipv6 || '未发现';
@@ -262,7 +265,7 @@ return baseclass.extend({
 			confirm.addEventListener('click', function() {
 				const ip = address.value.trim();
 				const number = ipNumber(ip);
-				const value = mode.value === 'system' ? '' : mac.value.trim().replace(/-/g, ':').toUpperCase();
+				const value = mac.value.trim().replace(/-/g, ':').toUpperCase();
 				if (number == null || number >= 224 * 2 ** 24 || /^(0|127|169\.254)\./.test(ip) || ip === state.router) {
 					error.textContent = '请输入有效的设备 IPv4 地址，且与路由器地址不同。';
 					address.focus();
@@ -273,15 +276,15 @@ return baseclass.extend({
 					address.focus();
 					return;
 				}
-				if (mode.value !== 'system' && (!/^[0-9A-F][02468ACE](?::[0-9A-F]{2}){5}$/.test(value) ||
+				if ((value || mode.value !== 'system') && (!/^[0-9A-F][02468ACE](?::[0-9A-F]{2}){5}$/.test(value) ||
 				    value === '00:00:00:00:00:00')) {
 					error.textContent = '当前 IPv6 策略需要有效的设备 MAC 地址。';
 					mac.focus();
 					return;
 				}
 				if (value && Array.from(entries).some(([otherIP, other]) =>
-					otherIP !== originalIP && other.mode !== 'system' && other.mac === value)) {
-					error.textContent = '该 MAC 地址已用于另一台设备的 IPv6 策略。';
+					otherIP !== originalIP && other.mac === value)) {
+					error.textContent = '该 MAC 地址已用于另一台设备。';
 					mac.focus();
 					return;
 				}
@@ -316,7 +319,7 @@ return baseclass.extend({
 				return {
 					client: Array.from(entries.keys()).join(','),
 					ipv6_devices: Array.from(entries, ([ip, { mode, mac }]) =>
-						[ip, mode === 'system' ? '' : mac, mode].join('/')).join(',')
+						[ip, mac, mode].join('/')).join(',')
 				};
 			},
 			update: function(data) { state = data; },
