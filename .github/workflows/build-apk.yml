@@ -1,0 +1,92 @@
+name: Build OpenWrt APK
+
+on:
+  push:
+    branches: [main]
+    tags: ['v*']
+    paths:
+      - 'package/**'
+      - '.github/workflows/build-apk.yml'
+  pull_request:
+    paths:
+      - 'package/**'
+      - '.github/workflows/build-apk.yml'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    env:
+      IMAGEBUILDER_URL: https://downloads.openwrt.org/releases/25.12.6/targets/x86/64
+      IMAGEBUILDER_ARCHIVE: openwrt-imagebuilder-25.12.6-x86-64.Linux-x86_64.tar.zst
+      IMAGEBUILDER_SHA256: a792e29bd2233cda67a0823030bfb53c0b61fbb3836b2063e88adf89730d563b
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Install build dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install --no-install-recommends -y fakeroot zstd
+
+      - name: Build and verify the APK
+        shell: bash
+        run: |
+          archive="$RUNNER_TEMP/$IMAGEBUILDER_ARCHIVE"
+          curl --fail --silent --show-error --location --retry 3 \
+            --output "$archive" "$IMAGEBUILDER_URL/$IMAGEBUILDER_ARCHIVE"
+          printf '%s  %s\n' "$IMAGEBUILDER_SHA256" "$archive" | sha256sum --check
+          tar --zstd -xf "$archive" -C "$RUNNER_TEMP"
+
+          apk_tool="$RUNNER_TEMP/${IMAGEBUILDER_ARCHIVE%.tar.zst}/staging_dir/host/bin/apk"
+          sh package/build.sh "$apk_tool"
+
+          cd dist
+          shopt -s nullglob
+          packages=(luci-app-xboxdownload-openwrt-*.apk)
+          test "${#packages[@]}" -eq 1
+          "$apk_tool" adbdump --allow-untrusted "${packages[0]}" | grep -Fx '  arch: noarch'
+          if [[ "$GITHUB_REF_TYPE" == tag ]]; then
+            version="${packages[0]#luci-app-xboxdownload-openwrt-}"
+            test "$GITHUB_REF_NAME" = "v${version%-r*.apk}"
+          fi
+          sha256sum "${packages[0]}" > SHA256SUMS
+
+      - name: Upload build artifact
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: openwrt-apk
+          path: |
+            dist/*.apk
+            dist/SHA256SUMS
+          if-no-files-found: error
+
+  release:
+    if: github.event_name == 'push' && github.ref_type == 'tag'
+    needs: build
+    runs-on: ubuntu-24.04
+    timeout-minutes: 5
+    permissions:
+      contents: write
+    steps:
+      - name: Download build artifact
+        uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          name: openwrt-apk
+          path: dist
+
+      - name: Publish tagged release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          RELEASE_TAG: ${{ github.ref_name }}
+        shell: bash
+        run: |
+          cd dist
+          sha256sum --check SHA256SUMS
+          gh release create "$RELEASE_TAG" ./*.apk SHA256SUMS \
+            --repo "$GITHUB_REPOSITORY" --verify-tag --generate-notes
