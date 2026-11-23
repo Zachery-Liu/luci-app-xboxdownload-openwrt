@@ -1,0 +1,37 @@
+<svg xmlns="http://www.w3.org/2000/svg" xmlns:xlink="http://www.w3.org/1999/xlink" viewBox="0 0 1254 1254" role="img" aria-labelledby="title desc">
+  <title id="title">Xbox Series S 下载加速助手</title>
+  <desc id="desc">深绿色圆角背景上，明绿色弧线、白色下载箭头与横放的游戏主机剪影。</desc>
+  <defs>
+    <radialGradient id="bg" cx="50%" cy="48%" r="72%">
+      <stop offset="0" stop-color="#006529"/>
+      <stop offset="0.67" stop-color="#004c1d"/>
+      <stop offset="1" stop-color="#003d16"/>
+    </radialGradient>
+    <linearGradient id="arc" x1="0" y1="0" x2="1" y2="0">
+      <stop offset="0" stop-color="#79fa19"/>
+      <stop offset="0.5" stop-color="#91ff31"/>
+      <stop offset="1" stop-color="#79fa19"/>
+    </linearGradient>
+    <clipPath id="clip"><rect x="75" y="76" width="1100" height="1100" rx="270"/></clipPath>
+  </defs>
+  <g clip-path="url(#clip)">
+    <rect x="75" y="76" width="1100" height="1100" fill="url(#bg)"/>
+
+    <!-- Only the uppermost arc ends are gently rounded; retain the original arrow and console panel silhouette. -->
+    <path fill="url(#arc)" d="M214 439 C304 306 457 208 623 208 C791 208 948 309 1037 442 Q1044 454 1033 459 Q1022 465 1013 454 C906 330 766 266 623 266 C480 266 341 330 236 453 Q222 467 214 458 Q207 451 214 439Z"/>
+
+    <!-- Download arrow -->
+    <path fill="#fff" d="M596 352 H653 A23 23 0 0 1 676 375 V499 H754 Q774 499 765 519 L639 651 Q625 665 612 651 L484 519 Q474 499 494 499 H573 V375 A23 23 0 0 1 596 352Z"/>
+
+    <!-- Series S laying horizontally: top panel, circular ventilation -->
+    <path fill="#fff" d="M334 681 H914 Q920 681 924 688 L1013 808 H235 L325 688 Q329 681 334 681Z"/>
+    <ellipse cx="747" cy="746" rx="175" ry="51" fill="#00501f"/>
+
+    <!-- Front panel with USB, controller pairing and power indicator -->
+    <rect x="235" y="819" width="778" height="137" rx="13" fill="#fff"/>
+    <rect x="284" y="897" width="61" height="26" rx="3" fill="#005021"/>
+    <circle cx="384" cy="909" r="11" fill="#005021"/>
+    <circle cx="934" cy="882" r="34" fill="#005021"/>
+    <!-- Keep the dark circular power indicator blank; remove only the white X. -->
+  </g>
+</svg>
