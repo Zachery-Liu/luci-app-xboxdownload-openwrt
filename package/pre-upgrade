@@ -7,14 +7,14 @@ init="/etc/init.d/$legacy"
 
 runtime=/var/run/xboxdownload_openwrt
 mkdir -p "$runtime" || exit 1
+backup=
+trap '[ -z "$backup" ] || rm -f "$backup"' EXIT
 if [ -f "/etc/config/$legacy" ]; then
 	backup=$(mktemp "$runtime/migrate.XXXXXX") || exit 1
-	if uci -q export "$legacy" > "$backup"; then
-		mv -f "$backup" "$runtime/legacy.uci" || exit 1
-	else
-		rm -f "$backup"
-		exit 1
-	fi
+	uci -q export "$legacy" > "$backup" || exit 1
 fi
-"$init" stop
-"$init" disable
+if ! "$init" stop || ! "$init" disable; then
+	echo 'Could not stop and disable the legacy Xbox Download service before migration.' >&2
+	exit 1
+fi
+[ -z "$backup" ] || mv -f "$backup" "$runtime/legacy.uci"

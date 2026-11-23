@@ -168,6 +168,9 @@ main_ip=203.0.113.20
 legacy_ip=2001:db8:3::10
 [ "$(validate_settings)" = ipv6_cdn ]
 legacy_ip=203.0.113.10
+app_ip=2001:db8:3::20
+[ "$(validate_settings)" = ipv6_cdn ]
+app_ip=
 validate_settings
 filter_aaaa=1
 [ "$(validate_settings)" = ipv6_filter ]

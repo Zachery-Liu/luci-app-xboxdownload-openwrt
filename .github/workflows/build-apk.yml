@@ -6,10 +6,12 @@ on:
     tags: ['v*']
     paths:
       - 'package/**'
+      - 'tests/**'
       - '.github/workflows/build-apk.yml'
   pull_request:
     paths:
       - 'package/**'
+      - 'tests/**'
       - '.github/workflows/build-apk.yml'
   workflow_dispatch:
 
@@ -24,6 +26,8 @@ jobs:
       IMAGEBUILDER_URL: https://downloads.openwrt.org/releases/25.12.6/targets/x86/64
       IMAGEBUILDER_ARCHIVE: openwrt-imagebuilder-25.12.6-x86-64.Linux-x86_64.tar.zst
       IMAGEBUILDER_SHA256: a792e29bd2233cda67a0823030bfb53c0b61fbb3836b2063e88adf89730d563b
+      ROOTFS_ARCHIVE: openwrt-25.12.6-x86-64-generic-targz-rootfs.tar.gz
+      ROOTFS_SHA256: d09cb68dd78a7f7b1c4ed788ad42162e07ec094b20f66b382cd4f91c9443970f
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
@@ -32,7 +36,7 @@ jobs:
       - name: Install build dependencies
         run: |
           sudo apt-get update
-          sudo apt-get install --no-install-recommends -y fakeroot zstd
+          sudo apt-get install --no-install-recommends -y dnsutils iproute2 iputils-ping nftables zstd
 
       - name: Build and verify the APK
         shell: bash
@@ -44,7 +48,7 @@ jobs:
           tar --zstd -xf "$archive" -C "$RUNNER_TEMP"
 
           apk_tool="$RUNNER_TEMP/${IMAGEBUILDER_ARCHIVE%.tar.zst}/staging_dir/host/bin/apk"
-          sh package/build.sh "$apk_tool"
+          sudo sh package/build.sh "$apk_tool"
 
           cd dist
           shopt -s nullglob
@@ -56,6 +60,18 @@ jobs:
             test "$GITHUB_REF_NAME" = "v${version%-r*.apk}"
           fi
           sha256sum "${packages[0]}" > SHA256SUMS
+
+      - name: Run OpenWrt regression and package installation tests
+        shell: bash
+        run: |
+          rootfs="$RUNNER_TEMP/$ROOTFS_ARCHIVE"
+          curl --fail --silent --show-error --location --retry 3 \
+            --output "$rootfs" "$IMAGEBUILDER_URL/$ROOTFS_ARCHIVE"
+          printf '%s  %s\n' "$ROOTFS_SHA256" "$rootfs" | sha256sum --check
+          apk_tool="$RUNNER_TEMP/${IMAGEBUILDER_ARCHIVE%.tar.zst}/staging_dir/host/bin/apk"
+          sudo env OPENWRT_ROOTFS="$rootfs" APK_TOOL="$apk_tool" sh tests/install-package.sh dist/*.apk
+          sudo env OPENWRT_ROOTFS="$rootfs" sh tests/reliability.sh
+          sudo env OPENWRT_ROOTFS="$rootfs" sh tests/ipv6-devices.sh
 
       - name: Upload build artifact
         uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2

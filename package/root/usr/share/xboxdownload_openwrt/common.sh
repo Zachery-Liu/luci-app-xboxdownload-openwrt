@@ -184,10 +184,6 @@ validate_settings() {
 	case ",$normalized," in
 		*/dns,*) [ "$filter_aaaa" = 0 ] || { printf ipv6_filter; return 1; } ;;
 	esac
-	case ",$normalized," in
-		*/block,*)
-			case "$main_ip,$legacy_ip,$global_ip" in *:*) printf ipv6_cdn; return 1 ;; esac ;;
-	esac
 	case "$upstream" in
 		'') ;;
 		*:*) public_ipv6 "$upstream" || { printf upstream; return 1; } ;;
@@ -197,6 +193,9 @@ validate_settings() {
 		eval "value=\${$key}"
 		[ -z "$value" ] && continue
 		node_ip "$value" || { printf cdn; return 1; }
+		case ",$normalized," in
+			*/block,*) case "$value" in *:*) printf ipv6_cdn; return 1 ;; esac ;;
+		esac
 		case "$value:$filter_aaaa" in *:*:1) printf ipv6; return 1 ;; esac
 	done
 }

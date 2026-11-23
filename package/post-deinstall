@@ -1,0 +1,16 @@
+#!/bin/sh
+
+[ -z "$IPKG_INSTROOT" ] && [ "$IPKG_NO_SCRIPT" != 1 ] || exit 0
+status=0
+# Retry in case apk completed removal after a failed pre-deinstall hook.
+if ! nft -f - <<'EOF'
+destroy table ip xboxdownload_openwrt
+destroy table inet xboxdownload_openwrt_ipv6
+EOF
+then
+	echo 'Could not remove Xbox Download firewall rules after package removal.' >&2
+	status=1
+fi
+rm -f /tmp/luci-indexcache.*
+/etc/init.d/rpcd reload >/dev/null 2>&1 || true
+exit "$status"

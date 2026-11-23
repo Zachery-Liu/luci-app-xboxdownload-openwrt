@@ -28,7 +28,7 @@ const errors = {
 	ipv6_mac_duplicate: '同一个 MAC 地址只能配置一次 IPv6 策略，请检查加速设备列表。',
 	ipv6_reload: '设备配置已升级，请刷新页面后再保存。',
 	ipv6_filter: '保留 IPv6 时，请先关闭「过滤已选设备的 AAAA 应答」。',
-	ipv6_cdn: '关闭 Xbox 公网 IPv6 前，请把 Xbox com、cn1、cn2 节点切换到 IPv4 或自动解析。',
+	ipv6_cdn: '有设备关闭了公网 IPv6。请将所有已填的 IPv6 下载节点改用 IPv4 或留空。',
 	lan: '路由器的 lan 接口没有可用的 IPv4 地址。',
 	lan_ipv6: 'LAN 暂无可用的 IPv6 链路本地地址，已恢复原设置。',
 	dns_upstream: '无法验证普通域名的 DNS 转发，已恢复原设置。',
@@ -143,14 +143,16 @@ return view.extend({
 		const logSettings = settingsSection('logging', null, initial);
 		const logTable = new ui.Table(['时间', '客户端 IP', '请求', '域名 / 跳转'], { sortable: false });
 		const log = E('div', { class: 'xb-log' }, [logTable.render()]);
-		const clear = E('button', { class: 'cbi-button cbi-button-remove', type: 'button' }, ['清空插件日志']);
+		const clear = E('button', { class: 'cbi-button cbi-button-remove', type: 'button',
+			title: '仅重置此页显示，旧记录仍保留在系统日志中。' }, ['重置日志显示']);
 		const options = {};
 		function option(section, type, key, label, description) {
 			const value = section.option(type, key, label, description);
 			options[key] = value;
 			return value;
 		}
-		const mode = option(downloads, form.ListValue, 'mode', '服务模式');
+		const mode = option(downloads, form.ListValue, 'mode', '服务模式',
+			'DNS + HTTP 302 可将 Xbox 的 HTTP 下载切到 CN 线路。仅 DNS 选点时，cn1、cn2 只影响对应的 .cn 域名，原始 .com 域名使用 Xbox com 下载 IP 或系统 DNS。');
 		mode.default = 'redirect';
 		mode.value('redirect', 'DNS + HTTP 302');
 		mode.value('dns', '仅 DNS 选点');
@@ -377,7 +379,7 @@ return view.extend({
 				if (response.error) throw new Error(response.error);
 				update(await getStatus());
 			} catch (error) {
-				notify('清空日志失败。');
+				notify('重置日志显示失败。');
 			} finally {
 				updating = false;
 				update(state);

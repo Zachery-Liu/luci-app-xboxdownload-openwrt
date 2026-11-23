@@ -56,6 +56,7 @@ launch_dns() {
 	chroot "$root" /usr/sbin/dnsmasq -k -C /dev/null --no-resolv --bind-interfaces \
 		--listen-address="$1" --local=/com/net/ --address="/ordinary.test/$2" \
 		--host-record="$host_record" \
+		--host-record=assets1.xboxlive.com,203.0.113.70 --host-record=dlassets.xboxlive.com,203.0.113.71 \
 		--pid-file="/tmp/upstream-$1.pid" &
 	dns=$!
 	children="$children $dns"
@@ -126,6 +127,29 @@ wait_value "$run/error" 'Could not verify HTTP 302 redirects'
 assert_rules_removed
 wait "$supervisor" || true
 echo 'PASS: incorrect startup redirect and runtime query loss both restore system DNS'
+
+chroot "$root" sh -ec '
+	. /lib/functions.sh
+	. /etc/init.d/xboxdownload_openwrt
+	load_settings
+	mode=dns
+	lan_ip=192.0.2.1
+	main_ip=203.0.113.80
+	legacy_ip=203.0.113.81
+	global_ip=
+	write_dns > "$RUNDIR/dnsmasq.conf"
+'
+chroot "$root" /usr/sbin/dnsmasq -k -C /tmp/run/xboxdownload_openwrt/dnsmasq.conf &
+dns_only=$!
+children="$children $dns_only"
+sleep 0.2
+[ "$(query assets1.xboxlive.cn)" = 203.0.113.80 ]
+[ "$(query dlassets.xboxlive.cn)" = 203.0.113.81 ]
+[ "$(query assets1.xboxlive.com)" = 203.0.113.70 ]
+[ "$(query dlassets.xboxlive.com)" = 203.0.113.71 ]
+kill "$dns_only"
+wait "$dns_only"
+echo 'PASS: DNS-only mode applies CN nodes to CN hostnames and forwards COM hostnames'
 
 # Run the real rpcd configuration logic and UCI, using an init fixture to emulate procd outcomes.
 sed -i 's@^INIT=.*@INIT=/tmp/test-init@; s@^\. /lib/functions/network.sh$@. /tmp/test-network@' "$rpc"

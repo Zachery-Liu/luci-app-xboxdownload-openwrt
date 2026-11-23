@@ -158,7 +158,8 @@ return baseclass.extend({
 			const section = map.section(form.NamedSection, 'device', 'device');
 			const pickerOption = section.option(form.ListValue, 'host', '局域网设备');
 			pickerOption.value('', '选择局域网设备');
-			const addressOption = section.option(form.Value, 'ipv4', 'IPv4 地址');
+			const addressOption = section.option(form.Value, 'ipv4', 'IPv4 地址',
+				'IPv4 加速按此地址识别设备。建议在路由器的 DHCP 设置中为该设备保留此地址。');
 			addressOption.placeholder = '例如 192.168.1.156';
 			const address6Option = section.option(form.Value, 'ipv6', 'IPv6 地址');
 			const modeOption = section.option(form.ListValue, 'mode', 'IPv6 策略');
