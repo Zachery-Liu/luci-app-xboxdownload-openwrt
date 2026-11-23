@@ -9,6 +9,7 @@ if [ -x /etc/init.d/xboxdownload_openwrt ]; then
 			uci -q import xboxdownload_openwrt && uci -q commit xboxdownload_openwrt || exit 1
 		rm -f "$backup" "/etc/config/$legacy"
 	fi
+	chown root:root /etc/config/xboxdownload_openwrt || exit 1
 	/etc/init.d/xboxdownload_openwrt enable
 	if [ "$(uci -q get xboxdownload_openwrt.main.enabled)" = 1 ]; then
 		/etc/init.d/xboxdownload_openwrt restart
