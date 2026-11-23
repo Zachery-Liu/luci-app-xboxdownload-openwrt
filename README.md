@@ -29,6 +29,10 @@
 
 ![LuCI 服务页，显示运行状态、路由器 DNS、已选设备和下载线路](docs/screenshots/service.png)
 
+### 设备管理
+
+![LuCI 设备页，显示设备的 IPv4、MAC 地址和 IPv6 策略](docs/screenshots/devices.png)
+
 ### 节点测速
 
 ![LuCI 测速页，显示 CDN 节点的下载速度、延迟和选用按钮](docs/screenshots/speed-test.png)
