@@ -58,12 +58,9 @@
 
 ![CDN 节点测速](docs/screenshots/speed-test.png)
 
-<details>
-<summary>Xbox 下载实测</summary>
+### Xbox 下载实测
 
 ![Xbox 游戏下载](docs/screenshots/xbox-download.jpg)
-
-</details>
 
 ## 下载与文档
 
