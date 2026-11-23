@@ -74,16 +74,15 @@ jobs:
           sudo env OPENWRT_ROOTFS="$rootfs" sh tests/reliability.sh
           sudo env OPENWRT_ROOTFS="$rootfs" sh tests/ipv6-devices.sh
 
-      - name: Test LuCI in Chromium
+      - name: Test LuCI in Chrome
         shell: bash
         run: |
           python3 -m venv "$RUNNER_TEMP/browser-tests"
           source "$RUNNER_TEMP/browser-tests/bin/activate"
           pip install playwright==1.62.0
-          python -m playwright install --with-deps chromium
           mkdir -p "$RUNNER_TEMP/luci"
           tar -xzf "$RUNNER_TEMP/$ROOTFS_ARCHIVE" -C "$RUNNER_TEMP/luci" ./www
-          OPENWRT_WWW="$RUNNER_TEMP/luci/www" python tests/luci-browser.py
+          OPENWRT_WWW="$RUNNER_TEMP/luci/www" PLAYWRIGHT_CHANNEL=chrome python tests/luci-browser.py
 
       - name: Upload build artifact
         uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
