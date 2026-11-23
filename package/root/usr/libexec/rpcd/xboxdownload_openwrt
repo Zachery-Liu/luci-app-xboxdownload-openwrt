@@ -143,7 +143,16 @@ configure() {
 	trap 'lock -u /var/lock/xboxdownload_openwrt.lock' EXIT
 	load_settings
 	previous_enabled=$enabled
-	json_get_vars client main_ip legacy_ip enabled extra
+	json_get_vars extra
+	for key in client main_ip legacy_ip enabled; do
+		if json_get_type type "$key"; then
+			case "$key:$type" in
+				enabled:int|client:string|main_ip:string|legacy_ip:string) ;;
+				*) result invalid; return ;;
+			esac
+			json_get_var "$key" "$key"
+		fi
+	done
 	if [ -n "$extra" ]; then
 		json_load "$extra" || { result invalid; return; }
 		# An older LuCI page must not overwrite a saved per-device configuration.

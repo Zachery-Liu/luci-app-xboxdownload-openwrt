@@ -9,7 +9,6 @@ configured_upstream=${4:-}
 preferred_upstream=${configured_upstream:-$lan_ip}
 active_upstream=$preferred_upstream
 active_upstream_state=normal
-probe_sequence=0
 local_dns="127.0.0.1:$DNS_PORT"
 local_dns6=${5:-}
 supervisor_pid=$$
@@ -60,14 +59,26 @@ dns_ready() {
 		{ [ -z "$local_dns6" ] || dns_probe "$local_dns6"; }
 }
 
+public_dns_answer() {
+	local address
+	/bin/busybox nslookup -timeout=1 -retry=1 -type=A "$1" "$2" 2>/dev/null |
+		awk '/^Name:/ { answer=1 } answer && /^Address: / { print $2 }' |
+		{
+			while read -r address; do
+				public_ipv4 "$address" && exit 0
+			done
+			exit 1
+		}
+}
+
 forwarding_ready() {
-	local suffix reply
-	probe_sequence=$((probe_sequence + 1))
-	# Use a fresh name so cached positive answers cannot mask a failed upstream.
-	for suffix in com net; do
-		reply=$(/bin/busybox nslookup -timeout=1 -retry=1 -type=A \
-			"xb-$token-$probe_sequence.$suffix." "$1" 2>/dev/null) && return 0
-		case "$reply" in *': NXDOMAIN') return 0 ;; esac
+	local host
+	# Accept a public A answer from any of several independent DNS zones.
+	for host in www.baidu.com. www.microsoft.com. www.cloudflare.com.; do
+		if public_dns_answer "$host" "$1"; then
+			forwarding_host=$host
+			return 0
+		fi
 	done
 	return 1
 }
@@ -91,11 +102,11 @@ reload_upstream() {
 }
 
 switch_upstream() {
-	local previous=$active_upstream
+	local previous=$active_upstream host=$forwarding_host
 	reload_upstream "$1" || return 1
 	# dnsmasq reloads servers-file asynchronously after SIGHUP.
 	sleep 1
-	forwarding_ready "$local_dns" && return 0
+	public_dns_answer "$host" "$local_dns" && return 0
 	if ! reload_upstream "$previous"; then
 		failure='Could not set DNS upstream'
 		exit 1
@@ -143,7 +154,8 @@ monitor_services() {
 				return 1
 			fi
 		fi
-		if forwarding_ready "$local_dns"; then
+		# Also query the active resolver so the plugin's cache cannot conceal its loss.
+		if forwarding_ready "$active_upstream" && public_dns_answer "$forwarding_host" "$local_dns"; then
 			failures=0
 			if [ "$active_upstream_state" = fallback ]; then
 				if [ "$retry_delay" -gt 0 ]; then

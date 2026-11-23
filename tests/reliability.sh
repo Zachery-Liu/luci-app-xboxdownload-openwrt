@@ -52,8 +52,10 @@ wait_value() {
 }
 
 launch_dns() {
+	local host_record="www.microsoft.com,$2"
 	chroot "$root" /usr/sbin/dnsmasq -k -C /dev/null --no-resolv --bind-interfaces \
 		--listen-address="$1" --local=/com/net/ --address="/ordinary.test/$2" \
+		--host-record="$host_record" \
 		--pid-file="/tmp/upstream-$1.pid" &
 	dns=$!
 	children="$children $dns"
@@ -75,6 +77,23 @@ assert_rules_removed() {
 
 DATA_PATH=/usr/share/xboxdownload_openwrt
 launch_dns 192.0.2.1 203.0.113.10
+chroot "$root" /usr/sbin/dnsmasq -k -C /dev/null --no-resolv --bind-interfaces \
+	--listen-address=192.0.2.9 --local=/com/net/ --server=/ordinary.test/192.0.2.99 \
+	--pid-file=/tmp/nxdomain-only.pid &
+negative_dns=$!
+children="$children $negative_dns"
+sleep 0.2
+launch_supervisor nxdomain-only
+wait_value "$run/ready" nxdomain-only
+wait_value "$run/upstream-state" fallback
+query() { dig +short +tries=1 +time=2 @127.0.0.1 -p 15353 "$1"; }
+[ "$(query fallback.ordinary.test)" = 203.0.113.10 ]
+[ "$(query assets1.xboxlive.com)" = 192.0.0.8 ]
+kill "$supervisor" "$negative_dns"
+wait "$supervisor"
+wait "$negative_dns"
+echo 'PASS: local NXDOMAIN responses alone cannot keep DNS on the broken upstream'
+
 launch_dns 192.0.2.9 203.0.113.20
 preferred_dns=$dns
 cp "$data/domains" "$lab/domains"
@@ -88,7 +107,6 @@ cp "$lab/domains" "$data/domains"
 launch_supervisor healthy-redirect
 wait_value "$run/ready" healthy-redirect
 resolver_pid=$(cat "$run/dnsmasq.pid")
-query() { dig +short +tries=1 +time=2 @127.0.0.1 -p 15353 "$1"; }
 [ "$(query first.ordinary.test)" = 203.0.113.20 ]
 kill "$preferred_dns"
 wait "$preferred_dns"
@@ -169,3 +187,15 @@ wait_value "$run/error" 'Could not restore previous settings or service'
 touch "$root/tmp/stop-fails"
 [ "$(configure 1)" = rollback_rules ]
 echo 'PASS: rollback checks readiness, handles stop failures and reports failed recovery'
+
+rm "$root/tmp/stop-fails" "$root/tmp/rollback-fails"
+printf '%s\n' '{"main_ip":"203.0.113.55","enabled":0}' |
+	chroot "$root" /usr/libexec/rpcd/xboxdownload_openwrt call configure |
+	python3 -c 'import json,sys; assert json.load(sys.stdin)["error"] == ""'
+printf '%s\n' '{"extra":"{\"log_mode\":\"all\"}"}' |
+	chroot "$root" /usr/libexec/rpcd/xboxdownload_openwrt call configure |
+	python3 -c 'import json,sys; assert json.load(sys.stdin)["error"] == ""'
+[ "$(chroot "$root" uci -q get xboxdownload_openwrt.main.main_ip)" = 203.0.113.55 ]
+[ "$(chroot "$root" uci -q get xboxdownload_openwrt.main.log_mode)" = all ]
+[ "$(chroot "$root" uci -q get xboxdownload_openwrt.main.enabled)" = 0 ]
+echo 'PASS: a log-only configuration update preserves the selected CDN and service state'

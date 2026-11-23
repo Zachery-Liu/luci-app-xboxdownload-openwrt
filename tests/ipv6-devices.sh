@@ -180,7 +180,8 @@ EOF
 chroot "$root" sh /tmp/generate.sh
 
 chroot "$root" /usr/sbin/dnsmasq -k -C /dev/null --no-resolv --interface=br-xbtest --bind-interfaces \
-	--local=/com/net/ --host-record=ordinary.test,203.0.113.40,2001:db8:4::40 \
+	--local=/com/net/ --host-record=www.microsoft.com,203.0.113.40 \
+	--host-record=ordinary.test,203.0.113.40,2001:db8:4::40 \
 	--host-record=assets1.xboxlive.com,203.0.113.50,2001:db8:4::50 \
 	--host-record=assets1.xboxlive.cn,203.0.113.60,2001:db8:4::60 --pid-file=/tmp/system-dns.pid &
 children="$children $!"

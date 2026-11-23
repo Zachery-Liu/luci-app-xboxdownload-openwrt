@@ -8,10 +8,10 @@
 'require xboxdownload_openwrt.speed as speedTest';
 'require xboxdownload_openwrt.devices as devicePicker';
 
-const getStatus = rpc.declare({ object: 'xboxdownload_openwrt', method: 'status', expect: { '': {} } });
+const getStatus = rpc.declare({ object: 'xboxdownload_openwrt', method: 'status', reject: true });
 const configure = rpc.declare({
 	object: 'xboxdownload_openwrt', method: 'configure',
-	params: ['client', 'main_ip', 'legacy_ip', 'enabled', 'extra'], expect: { '': {} }
+	params: ['client', 'main_ip', 'legacy_ip', 'enabled', 'extra'], reject: true
 });
 const clearLogs = rpc.declare({ object: 'xboxdownload_openwrt', method: 'clear_logs', expect: { '': {} } });
 const extraKeys = ['upstream', 'global_ip', 'app_ip', 'ps_ip', 'ns_ip', 'ea_ip', 'battle_ip',
@@ -90,6 +90,27 @@ function helpTooltip(label, description) {
 
 function normalizeClients(value) {
 	return Array.from(new Set(value.split(/[\s,，]+/).filter(Boolean))).join(',');
+}
+
+function sameSetting(key, first, second) {
+	first ??= settingDefaults[key] || '';
+	second ??= settingDefaults[key] || '';
+	if (key === 'client') return normalizeClients(first) === normalizeClients(second);
+	if (key === 'ipv6_devices') {
+		const active = value => value.toUpperCase().split(',').filter(row => !row.endsWith('/SYSTEM')).sort().join(',');
+		return active(first) === active(second);
+	}
+	return first === second;
+}
+
+function settingsPatch(settings, original) {
+	const patch = Object.fromEntries(Object.entries(settings).filter(([key, value]) =>
+		!sameSetting(key, value, original[key])));
+	if ('client' in patch || 'ipv6_devices' in patch) {
+		patch.client = settings.client;
+		patch.ipv6_devices = settings.ipv6_devices;
+	}
+	return patch;
 }
 
 return view.extend({
@@ -189,21 +210,10 @@ return view.extend({
 		const overviewForm = await renderSettings(overview);
 		overviewForm.classList.add('xb-overview');
 		let state = initial;
+		let formBase = initial;
 		let pending = session.getLocalData(pendingKey);
 		let updating = false;
 		let shown;
-
-		function routerSettingsChanged(settings) {
-			return Object.keys(settings).some(key => {
-				const saved = state[key] || settingDefaults[key] || '';
-				if (key === 'client') return normalizeClients(settings.client) !== normalizeClients(saved);
-				if (key === 'ipv6_devices') {
-					const active = value => value.toUpperCase().split(',').filter(row => !row.endsWith('/SYSTEM')).sort().join(',');
-					return active(settings[key]) !== active(saved);
-				}
-				return settings[key] !== saved;
-			});
-		}
 
 		function updateControls() {
 			const settings = fields();
@@ -264,25 +274,30 @@ return view.extend({
 				device ? device.name + ' · ' + ip : ip));
 		}
 
-		async function save(enabled, settings) {
+		async function save(enabled, patch = {}) {
 			if (updating)
 				return false;
 			updating = true;
 			update(state);
 			try {
-				const extra = Object.fromEntries(extraKeys.map(key => [key, settings[key] || '']));
-				const response = await configure(settings.client, settings.main_ip, settings.legacy_ip, enabled,
+				const extra = Object.fromEntries(extraKeys.filter(key => key in patch).map(key => [key, patch[key]]));
+				const response = await configure(patch.client, patch.main_ip, patch.legacy_ip, enabled,
 					JSON.stringify(extra));
-				if (response.error) {
+				if (typeof response?.error !== 'string') throw new Error('Invalid configuration reply');
+				if (response.error !== '') {
 					notify(errors[response.error] || '参数无效或服务暂时不可用。');
 					if (response.error === 'rollback' || response.error === 'rollback_rules')
 						await getStatus().then(update, () => {});
 					return false;
 				}
-				update(await getStatus());
+				const saved = await getStatus();
+				if (typeof saved?.enabled !== 'boolean' || (enabled != null && saved.enabled !== Boolean(enabled)) ||
+					Object.entries(patch).some(([key, value]) => !sameSetting(key, value, saved[key])))
+					throw new Error('Could not verify applied settings');
+				update(saved);
 				return true;
 			} catch (error) {
-				notify('无法更新路由器设置。');
+				notify('无法确认路由器设置已应用。请稍后重试。');
 				return false;
 			} finally {
 				updating = false;
@@ -298,10 +313,10 @@ return view.extend({
 		}
 
 		primary.addEventListener('click', async function() {
-			if (await save(1, state)) speed.refresh();
+			if (await save(1)) speed.refresh();
 		});
 		stop.addEventListener('click', async function() {
-			if (await save(0, state)) speed.refresh();
+			if (await save(0)) speed.refresh();
 		});
 		function storePending(draft) {
 			pending = draft;
@@ -309,35 +324,45 @@ return view.extend({
 		}
 		this.stageSettings = function() {
 			if (updating || L.hasViewPermission() === false) return;
-			const settings = fields();
+			const patch = settingsPatch(fields(), formBase);
 			const speedSettings = speed.draftSettings();
-			if (!routerSettingsChanged(settings) && !speed.settingsChanged(speedSettings)) {
+			if (!Object.keys(patch).length && !speed.settingsChanged(speedSettings)) {
 				storePending(null);
 				return;
 			}
-			const stored = storePending({ settings, speedSettings });
+			const stored = storePending({ patch, speedSettings });
 			notify(stored ? '已保存，等待应用。' : '修改已暂存在当前页面。', 'info');
 		};
+		function restoreFields(patch) {
+			formBase = state;
+			const settings = { ...state, ...patch };
+			for (const [key, widget] of Object.entries(widgets))
+				widget.setValue(settings[key] ?? settingDefaults[key] ?? '');
+			devices.restoreDraft(settings);
+		}
 		this.restoreSettings = function() {
 			if (updating || L.hasViewPermission() === false) return;
-			const settings = pending?.settings || state;
-			for (const [key, widget] of Object.entries(widgets))
-				widget.setValue(settings[key] || settingDefaults[key] || '');
+			if (pending?.settings && !pending.patch)
+				notify('旧版暂存草稿无法区分已修改的字段，已载入路由器当前设置，请重新核对。', 'warning');
+			restoreFields(pending?.patch);
 			speed.restoreDraft(pending?.speedSettings);
-			devices.restoreDraft(settings);
 		};
 		this.submitSettings = async function() {
 			if (updating || L.hasViewPermission() === false) return;
 			const settings = fields();
 			const speedSettings = speed.draftSettings();
-			const changed = routerSettingsChanged(settings);
+			const patch = settingsPatch(settings, formBase);
+			const changed = Object.keys(patch).length > 0;
 			if (!changed && !speed.settingsChanged(speedSettings)) {
 				storePending(null);
 				return;
 			}
-			storePending({ settings, speedSettings });
+			storePending({ patch, speedSettings });
 			// Both LuCI apply actions use the plugin's configuration transaction.
-			if (changed && !await save(state.enabled ? 1 : 0, settings)) return;
+			if (changed) {
+				if (!await save(undefined, patch)) return;
+				restoreFields(settingsPatch(fields(), settings));
+			}
 			const persisted = speed.applySettings(speedSettings);
 			storePending(null);
 			notify(persisted ? '已保存并应用。' : '测速设置仅在当前页面生效，浏览器无法保存。', 'info');
