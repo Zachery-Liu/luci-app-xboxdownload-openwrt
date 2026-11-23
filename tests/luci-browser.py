@@ -155,10 +155,26 @@ with sync_playwright() as playwright:
     assert not requests
     smoke.goto(base_url + '/service')
     expect(field(smoke)).to_have_value('203.0.113.21')
+    for section in ('overview', 'downloads'):
+        content = app.locator(f'#cbi-xboxdownload-{section} .cbi-section-node')
+        assert content.evaluate("node => parseFloat(getComputedStyle(node).paddingBlockStart)") >= 8
+    overview = app.locator('#cbi-xboxdownload-overview .cbi-section-node')
+    assert overview.evaluate("node => parseFloat(getComputedStyle(node).paddingBlockEnd)") >= 8
     apply(smoke)
     expect(smoke.get_by_text('已保存并应用。')).to_be_visible()
     assert state['main_ip'] == '203.0.113.21' and '192.168.1.155' in state['client']
     print('PASS: add device, select a CDN, persist a draft across navigation and apply')
+    state['log'] += '\n17:14:19\tDNS A\t192.168.1.155\tassets1.xboxlive.com'
+    smoke.goto(base_url + '/logs')
+    log = app.get_by_role('table')
+    expect(log.get_by_role('columnheader')).to_have_text(['时间', '客户端 IP', '请求', '域名 / 跳转'])
+    expect(log.get_by_role('row').filter(has_text='HTTP 302').get_by_role('cell')).to_have_text(
+        ['17:14:20', '192.168.1.156', 'HTTP 302', 'assets1.xboxlive.com -> assets1.xboxlive.cn']
+    )
+    expect(log.get_by_role('row').filter(has_text='DNS A').get_by_role('cell')).to_have_text(
+        ['17:14:19', '192.168.1.155', 'DNS A', 'assets1.xboxlive.com']
+    )
+    print('PASS: HTTP and DNS log records align with their column headings')
     smoke.close()
 
     state, requests = initial.copy(), []

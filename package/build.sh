@@ -9,7 +9,7 @@ if [ "$(id -ru)" -ne 0 ]; then
 fi
 project=$(CDPATH='' cd -- "$(dirname -- "$0")/.." && pwd)
 name=luci-app-xboxdownload-openwrt
-version=1.0.1-r1
+version=1.0.1-r2
 stage=$(mktemp -d)
 trap 'rm -rf "$stage"' EXIT
 

@@ -262,7 +262,9 @@ return view.extend({
 			if (serviceError.textContent !== notice) serviceError.textContent = notice;
 			if (shown !== data.log) {
 				shown = data.log;
-				const rows = (data.log || '').split('\n').map(line => line.split('\t')).filter(row => row.length === 4);
+				const rows = (data.log || '').split('\n')
+					.map(line => line.split('\t')).filter(row => row.length === 4)
+					.map(([time, request, client, detail]) => [time, client, request, detail]);
 				logTable.update(rows, '暂无记录。').querySelectorAll('th[data-sortable-row]')
 					.forEach(th => th.removeAttribute('data-sortable-row'));
 			}

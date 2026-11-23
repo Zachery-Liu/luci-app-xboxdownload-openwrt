@@ -6,6 +6,20 @@
 	margin-block-end: 1rem;
 }
 
+.xb-app :is(#cbi-xboxdownload-overview, #cbi-xboxdownload-downloads) .cbi-section-node {
+	padding-block-start: .75rem;
+}
+
+.xb-app #cbi-xboxdownload-overview .cbi-section-node {
+	padding-block-end: .75rem;
+}
+
+.xb-app #cbi-xboxdownload-downloads .xb-row > .cbi-value-description {
+	flex-basis: 100%;
+	min-width: 0;
+	white-space: normal;
+}
+
 .xb-app [hidden],
 .xb-app [data-tab-title]:not([data-tab-active="true"]),
 .xb-app .xb-error:empty,

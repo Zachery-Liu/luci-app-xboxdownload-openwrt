@@ -136,5 +136,11 @@ jobs:
         run: |
           cd dist
           sha256sum --check SHA256SUMS
-          gh release create "$RELEASE_TAG" ./*.apk SHA256SUMS \
-            --repo "$GITHUB_REPOSITORY" --verify-tag --generate-notes
+          tag_commit=$(gh api "repos/$GITHUB_REPOSITORY/commits/$RELEASE_TAG" --jq '.sha')
+          test "$tag_commit" = "$GITHUB_SHA"
+          if gh release view "$RELEASE_TAG" --repo "$GITHUB_REPOSITORY" >/dev/null 2>&1; then
+            gh release upload "$RELEASE_TAG" ./*.apk SHA256SUMS --clobber --repo "$GITHUB_REPOSITORY"
+          else
+            gh release create "$RELEASE_TAG" ./*.apk SHA256SUMS \
+              --repo "$GITHUB_REPOSITORY" --verify-tag --generate-notes
+          fi
