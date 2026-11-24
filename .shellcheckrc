@@ -1,0 +1,2 @@
+# OpenWrt uses BusyBox ash; local variables are supported.
+shell=busybox

@@ -1,0 +1,56 @@
+{
+  "package/root/etc/init.d/xboxdownload_openwrt": {
+    "2034: START appears unused. Verify use (or export if used externally).": 1,
+    "2034: USE_PROCD appears unused. Verify use (or export if used externally).": 1,
+    "2154: lan_ip is referenced but not assigned.": 1,
+    "2154: lan_dev is referenced but not assigned.": 1,
+    "2154: log_mode is referenced but not assigned.": 1,
+    "2154: filter_aaaa is referenced but not assigned.": 1,
+    "1007: Remove space after = if trying to assign a value (for empty string, use var='' ... ).": 1,
+    "2154: enabled is referenced but not assigned.": 1,
+    "2154: log_path is referenced but not assigned.": 1,
+    "2154: probe_domain is referenced but not assigned.": 1
+  },
+  "package/root/usr/share/xboxdownload_openwrt/common.sh": {
+    "2034: DATA appears unused. Verify use (or export if used externally).": 1,
+    "2034: DNS_PORT appears unused. Verify use (or export if used externally).": 1,
+    "2034: HTTP_PORT appears unused. Verify use (or export if used externally).": 1,
+    "2034: HTTP_ADDRESS appears unused. Verify use (or export if used externally).": 1,
+    "2034: DNS_ZONE appears unused. Verify use (or export if used externally).": 1,
+    "2034: HEALTH_HOST appears unused. Verify use (or export if used externally).": 1,
+    "2034: HTTP_HEALTH_ERROR appears unused. Verify use (or export if used externally).": 1,
+    "2034: RULE_CLEANUP_ERROR appears unused. Verify use (or export if used externally).": 1,
+    "2034: SERVICE_LOCK appears unused. Verify use (or export if used externally).": 1,
+    "2034: UPSTREAM_STATE appears unused. Verify use (or export if used externally).": 1,
+    "1007: Remove space after = if trying to assign a value (for empty string, use var='' ... ).": 4,
+    "2154: lan_ip is referenced but not assigned.": 1,
+    "2154: ipv6_dns is referenced but not assigned.": 1,
+    "2154: ipv6_block is referenced but not assigned.": 1,
+    "2034: legacy_ipv6_config appears unused. Verify use (or export if used externally).": 1,
+    "2154: log_mode is referenced but not assigned.": 1,
+    "2154: enabled is referenced but not assigned.": 1,
+    "2154: filter_aaaa is referenced but not assigned.": 1,
+    "2154: log_path is referenced but not assigned.": 1,
+    "2154: upstream is referenced but not assigned.": 1
+  },
+  "package/root/usr/libexec/rpcd/xboxdownload_openwrt": {
+    "1007: Remove space after = if trying to assign a value (for empty string, use var='' ... ).": 2,
+    "2154: mode is referenced but not assigned (did you mean 'code'?).": 1,
+    "2154: enabled is referenced but not assigned.": 1,
+    "2034: attempt appears unused. Verify use (or export if used externally).": 1,
+    "2154: legacy_ipv6_config is referenced but not assigned.": 1,
+    "2034: ipv6_dns appears unused. Verify use (or export if used externally).": 1,
+    "2154: channel is referenced but not assigned.": 1,
+    "2154: source is referenced but not assigned.": 1,
+    "2154: family is referenced but not assigned.": 1,
+    "2154: group is referenced but not assigned.": 1,
+    "2154: ping_only is referenced but not assigned.": 1,
+    "2100: Use $((..)) for arithmetics, e.g. i=$((i - 2))": 1
+  },
+  "tests/reliability.sh": {
+    "2034: attempt appears unused. Verify use (or export if used externally).": 1
+  },
+  "tests/ipv6-devices.sh": {
+    "2034: attempt appears unused. Verify use (or export if used externally).": 1
+  }
+}

@@ -7,19 +7,29 @@ on:
     paths:
       - 'package/**'
       - 'tests/**'
-      - '.github/workflows/build-apk.yml'
+      - '.github/workflows/**'
+      - '.shellcheckrc'
+      - '.github/dependabot.yml'
   pull_request:
     paths:
       - 'package/**'
       - 'tests/**'
-      - '.github/workflows/build-apk.yml'
+      - '.github/workflows/**'
+      - '.shellcheckrc'
+      - '.github/dependabot.yml'
+  schedule:
+    - cron: '17 1 * * 1'
   workflow_dispatch:
 
 permissions:
   contents: read
 
+concurrency:
+  group: build-apk-${{ github.event_name == 'pull_request' && format('pr-{0}', github.event.pull_request.number) || github.ref }}
+  cancel-in-progress: ${{ github.ref_type != 'tag' }}
+
 jobs:
-  shellcheck:
+  lint:
     runs-on: ubuntu-24.04
     timeout-minutes: 5
     steps:
@@ -34,21 +44,18 @@ jobs:
           fi
           shellcheck --version
       - name: Check OpenWrt shell scripts
+        run: python3 tests/check-shell.py
+      - name: Install and run actionlint
         shell: bash
         run: |
-          scripts=()
-          while IFS= read -r -d '' path; do
-            if [[ "$path" == *.sh ]] || grep -IqE '^#![[:space:]]*(/bin/(sh|ash|bash)|/usr/bin/env[[:space:]]+(sh|ash|bash))([[:space:]]|$)' "$path"; then
-              scripts+=("$path")
-            fi
-          done < <(find package tests -type f -print0)
-          test "${#scripts[@]}" -gt 0
-          printf 'Checking %s\n' "${scripts[@]}"
-          # Report existing warnings without blocking builds while establishing a baseline.
-          if ! shellcheck --shell=sh --severity=warning "${scripts[@]}"; then
-            echo "::notice::Review ShellCheck diagnostics above. Error-level findings are blocking."
-          fi
-          shellcheck --shell=sh --severity=error "${scripts[@]}"
+          archive="$RUNNER_TEMP/actionlint.tar.gz"
+          curl --fail --silent --show-error --location --retry 3 \
+            --output "$archive" https://github.com/rhysd/actionlint/releases/download/v1.7.12/actionlint_1.7.12_linux_amd64.tar.gz
+          printf '%s  %s\n' 8aca8db96f1b94770f1b0d72b6dddcb1ebb8123cb3712530b08cc387b349a3d8 "$archive" | sha256sum --check
+          tar -xzf "$archive" -C "$RUNNER_TEMP" actionlint
+          "$RUNNER_TEMP/actionlint" -shellcheck="" -pyflakes=""
+      - name: Validate upstream sample discovery
+        run: python3 tests/check-upstreams.py validate
 
   build:
     runs-on: ubuntu-24.04
@@ -147,7 +154,7 @@ jobs:
 
   release:
     if: github.event_name == 'push' && github.ref_type == 'tag'
-    needs: [build, arm64, shellcheck]
+    needs: [build, arm64, lint]
     runs-on: ubuntu-24.04
     timeout-minutes: 5
     permissions:
@@ -170,8 +177,8 @@ jobs:
           tag_commit=$(gh api "repos/$GITHUB_REPOSITORY/commits/$RELEASE_TAG" --jq '.sha')
           test "$tag_commit" = "$GITHUB_SHA"
           if gh release view "$RELEASE_TAG" --repo "$GITHUB_REPOSITORY" >/dev/null 2>&1; then
-            gh release upload "$RELEASE_TAG" ./*.apk SHA256SUMS --clobber --repo "$GITHUB_REPOSITORY"
-          else
-            gh release create "$RELEASE_TAG" ./*.apk SHA256SUMS \
-              --repo "$GITHUB_REPOSITORY" --verify-tag --generate-notes
+            echo "::error::Release $RELEASE_TAG already exists. Create a new version tag; published assets are immutable."
+            exit 1
           fi
+          gh release create "$RELEASE_TAG" ./*.apk SHA256SUMS \
+            --repo "$GITHUB_REPOSITORY" --verify-tag --generate-notes
