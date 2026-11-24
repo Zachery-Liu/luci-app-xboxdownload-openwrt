@@ -19,6 +19,37 @@ permissions:
   contents: read
 
 jobs:
+  shellcheck:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - name: Install ShellCheck
+        run: |
+          if ! command -v shellcheck >/dev/null 2>&1; then
+            sudo apt-get update
+            sudo apt-get install --no-install-recommends -y shellcheck
+          fi
+          shellcheck --version
+      - name: Check OpenWrt shell scripts
+        shell: bash
+        run: |
+          scripts=()
+          while IFS= read -r -d '' path; do
+            if [[ "$path" == *.sh ]] || grep -IqE '^#![[:space:]]*(/bin/(sh|ash|bash)|/usr/bin/env[[:space:]]+(sh|ash|bash))([[:space:]]|$)' "$path"; then
+              scripts+=("$path")
+            fi
+          done < <(find package tests -type f -print0)
+          test "${#scripts[@]}" -gt 0
+          printf 'Checking %s\n' "${scripts[@]}"
+          # Report existing warnings without blocking builds while establishing a baseline.
+          if ! shellcheck --shell=sh --severity=warning "${scripts[@]}"; then
+            echo "::notice::Review ShellCheck diagnostics above. Error-level findings are blocking."
+          fi
+          shellcheck --shell=sh --severity=error "${scripts[@]}"
+
   build:
     runs-on: ubuntu-24.04
     timeout-minutes: 10
@@ -79,7 +110,7 @@ jobs:
         run: |
           python3 -m venv "$RUNNER_TEMP/browser-tests"
           source "$RUNNER_TEMP/browser-tests/bin/activate"
-          pip install playwright==1.62.0
+          pip install -r tests/requirements.txt
           mkdir -p "$RUNNER_TEMP/luci"
           tar -xzf "$RUNNER_TEMP/$ROOTFS_ARCHIVE" -C "$RUNNER_TEMP/luci" ./www
           OPENWRT_WWW="$RUNNER_TEMP/luci/www" PLAYWRIGHT_CHANNEL=chrome python tests/luci-browser.py
@@ -116,7 +147,7 @@ jobs:
 
   release:
     if: github.event_name == 'push' && github.ref_type == 'tag'
-    needs: [build, arm64]
+    needs: [build, arm64, shellcheck]
     runs-on: ubuntu-24.04
     timeout-minutes: 5
     permissions:
