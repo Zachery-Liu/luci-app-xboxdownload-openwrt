@@ -39,10 +39,28 @@
 
 ## 快速开始
 
-1. 从 [GitHub Releases](https://github.com/Zachery-Liu/luci-app-xboxdownload-openwrt/releases) 下载 APK，将它上传到路由器的 `/tmp/`，再通过 SSH 运行 `apk add --allow-untrusted /tmp/实际文件名.apk`。每个新版 APK 都附有对应的 `.sha256` 校验文件。
-2. 在 LuCI 打开「服务 → Xbox 下载助手」，在「设备」页添加 Xbox，点击「保存并应用」，再点击「启动服务」。建议给 Xbox 配置 DHCP 静态租约，避免换 IP 后加速失效。
-3. 在 Xbox 打开「设置 → 常规 → 网络设置 → 高级设置 → DNS 设置」，选择「自动」，并确认主机收到了这台路由器的 DNS。
-4. 要手动选节点，可在「测速」页导入并测试节点，点「选用」填入下载线路，再点「保存并应用」使其生效。
+带有项目公钥的签名版支持一键安装。在 OpenWrt 25.12 路由器上通过 SSH 以 root 执行以下命令。脚本会检查 GitHub 的最新正式版本，核对公钥与 APK 的 SHA-256，验证 APK 签名，然后导入项目公钥并安装。安装未签名的旧版时，请参照对应 Release 的说明。
+
+```sh
+installer=$(mktemp /tmp/xboxdownload-installer.XXXXXX) &&
+curl -fsSL -o "$installer" https://raw.githubusercontent.com/Zachery-Liu/luci-app-xboxdownload-openwrt/main/install.sh &&
+sh "$installer"
+```
+
+系统未安装 curl 时，使用 OpenWrt 自带的下载工具。
+
+```sh
+installer=$(mktemp /tmp/xboxdownload-installer.XXXXXX) &&
+uclient-fetch -O "$installer" https://raw.githubusercontent.com/Zachery-Liu/luci-app-xboxdownload-openwrt/main/install.sh &&
+sh "$installer"
+```
+
+也可以从 [GitHub Releases](https://github.com/Zachery-Liu/luci-app-xboxdownload-openwrt/releases) 下载 APK 手动安装。首次安装签名版本时，将核对过的[项目公钥](package/xboxdownload-openwrt-release.pem)放入路由器的 `/etc/apk/keys/`，再运行 `apk add /tmp/实际文件名.apk`。安装 v1.1.0 等旧版时，请参照对应 Release 的说明。
+
+1. 在 LuCI 打开「服务 → Xbox 下载助手」，在「设备」页添加 Xbox，点击「保存并应用」，再点击「启动服务」。建议给 Xbox 配置 DHCP 静态租约，避免换 IP 后加速失效。
+2. 在 Xbox 打开「设置 → 常规 → 网络设置 → 高级设置 → DNS 设置」，选择「自动」，并确认主机收到了这台路由器的 DNS。
+3. 要手动选节点，可在「测速」页导入并测试节点，点「选用」填入下载线路，再点「保存并应用」使其生效。
+4. 从 1.2.0 起，在「关于」页点击「检查更新」，可以安装 GitHub 上更新的正式版本。路由器校验包的 SHA-256 和项目签名后安装，并保留现有配置。
 
 cn1、cn2 使用上游的 IPv4 节点名单。「Akamai IP (IPv6)」可选 Xbox com 等 Akamai 测速目标。「DNS + HTTP 302」模式下，符合条件的 `.com` HTTP 请求跳转到国内 CDN，同域名的 HTTPS 仍连接原站。手动指定 Xbox com 节点后，设备直接连接对应节点。
 

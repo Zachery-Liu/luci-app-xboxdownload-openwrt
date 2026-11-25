@@ -1,5 +1,6 @@
 RUNDIR=/var/run/xboxdownload_openwrt
 DATA=/usr/share/xboxdownload_openwrt
+UPDATE_HISTORY=/etc/xboxdownload_openwrt
 DNS_PORT=15353
 HTTP_PORT=18080
 HTTP_ADDRESS=192.0.0.8
@@ -16,6 +17,8 @@ SERVICE_LOCK=/var/lock/xboxdownload_openwrt_lifecycle.flock
 LISTENER_LOCK=/var/lock/xboxdownload_openwrt_listeners.flock
 # shellcheck disable=SC2034
 CONFIG_LOCK=/var/lock/xboxdownload_openwrt_config.flock
+# shellcheck disable=SC2034
+UPGRADE_LOCK=/var/lock/xboxdownload_openwrt_upgrade.flock
 SERVICE_START_TIMEOUT=25
 UPSTREAM_FILE="$RUNDIR/upstreams.conf"
 UPSTREAM_STATE="$RUNDIR/upstream-state"
@@ -28,6 +31,14 @@ NODE_KEYS="main_ip legacy_ip global_ip app_ip ps_ip ns_ip ea_ip battle_ip"
 LEGACY_IPV6_KEYS="ipv6_dns ipv6_block ipv6_block_ip ipv6_block_mac"
 EXTRA_KEYS="upstream probe_domain global_ip app_ip ps_ip ns_ip ea_ip battle_ip mode filter_aaaa log_mode log_path ipv6_devices device_routes"
 SETTINGS_KEYS="enabled client main_ip legacy_ip $EXTRA_KEYS"
+
+record_update_time() (
+	umask 077
+	mkdir -p "$UPDATE_HISTORY" || exit 1
+	temp=$(mktemp "$UPDATE_HISTORY/.time.XXXXXX") || exit 1
+	trap 'rm -f "$temp"' EXIT
+	date +%s > "$temp" && mv -f "$temp" "$UPDATE_HISTORY/$1"
+)
 
 write_upstream() {
 	local temp file=${2:-$UPSTREAM_FILE}

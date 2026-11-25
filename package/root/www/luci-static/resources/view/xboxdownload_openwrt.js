@@ -7,6 +7,7 @@
 'require session';
 'require xboxdownload_openwrt.speed as speedTest';
 'require xboxdownload_openwrt.devices as devicePicker';
+'require xboxdownload_openwrt.about as aboutPage';
 
 const getStatus = rpc.declare({ object: 'xboxdownload_openwrt', method: 'status', reject: true });
 const configure = rpc.declare({
@@ -139,7 +140,7 @@ return view.extend({
 	load: function() {
 		const cached = session.getLocalData('menu');
 		const oldEntry = cached?.children?.admin?.children?.services?.children?.xboxdownload_openwrt;
-		if (oldEntry?.action?.type === 'view') {
+		if (oldEntry?.action?.type === 'view' || (oldEntry?.children && !oldEntry.children.about)) {
 			ui.menu.flushCache();
 			if (session.getLocalData('menu') == null) location.reload();
 		}
@@ -461,7 +462,14 @@ return view.extend({
 			E('div', { class: 'xb-row' }, [goDevices, primary, stop])
 		]);
 		const service = E('div', {}, [overviewForm, downloadForm]);
-		const pages = { service, devices: devices.element, speed: speed.element, logs: logForm };
+		const about = await aboutPage.render(L.resource('xboxdownload_openwrt/logo.svg'), () => {
+			if (updating) return '请等待配置操作完成后再安装更新。';
+			if (Object.keys(settingsPatch(fields(), formBase)).length || speed.settingsChanged())
+				return '您还有未保存或未应用的内容。请先「保存并应用」或「复位」，再安装更新。';
+			if (speed.isTesting()) return '请等待测速结束，或停止测速后再安装更新。';
+			return '';
+		});
+		const pages = { service, devices: devices.element, speed: speed.element, logs: logForm, about };
 		const header = await new form.JSONMap({}, 'Xbox 下载助手', [
 			'在 OpenWrt 上为选定设备加速 Xbox 下载。 ',
 			E('a', {
@@ -505,6 +513,8 @@ return view.extend({
 			activePage = name;
 			if (push) history.pushState(null, '', urls[name]);
 			description.hidden = name !== 'service';
+			header.hidden = name === 'about';
+			toolbar.hidden = name === 'about';
 			for (const [key, pane] of Object.entries(pages)) pane.hidden = key !== name;
 			for (const link of document.querySelectorAll('#tabmenu a[href]')) {
 				const page = paths.get(link.pathname);

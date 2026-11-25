@@ -21,6 +21,7 @@ cp "$1" "$root/tmp/package.apk"
 chroot "$root" apk add --no-network --allow-untrusted /tmp/curl-fixture.apk /tmp/package.apk
 
 [ "$(stat -c '%u:%g %a' "$root/etc/config/xboxdownload_openwrt")" = '0:0 644' ]
+grep -Eq '^[1-9][0-9]+$' "$root/etc/xboxdownload_openwrt/installed-at"
 for path in etc/init.d/xboxdownload_openwrt usr/libexec/rpcd/xboxdownload_openwrt \
 	usr/share/xboxdownload_openwrt/supervise usr/share/xboxdownload_openwrt/http/cgi-bin/redirect; do
 	[ "$(stat -c '%u:%g %a' "$root/$path")" = '0:0 755' ]
@@ -95,4 +96,5 @@ rules=$(nft list tables)
 ! printf '%s\n' "$rules" | grep -Fq xboxdownload_openwrt
 mv "$root/tmp/real-init" "$root/etc/init.d/xboxdownload_openwrt"
 chroot "$root" apk del --no-network luci-app-xboxdownload-openwrt
+[ ! -e "$root/etc/xboxdownload_openwrt/installed-at" ]
 echo 'PASS: uninstall detects surviving rules and the post-deinstall hook retries cleanup'

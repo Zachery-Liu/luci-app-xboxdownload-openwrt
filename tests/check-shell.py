@@ -8,7 +8,7 @@ import sys
 
 ROOT = Path(__file__).resolve().parents[1]
 baseline = json.loads((ROOT / "tests/shellcheck-baseline.json").read_text())
-scripts = []
+scripts = ["install.sh"]
 for directory in ("package", "tests"):
     for path in sorted((ROOT / directory).rglob("*")):
         if not path.is_file():

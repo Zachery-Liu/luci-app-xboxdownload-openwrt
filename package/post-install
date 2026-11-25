@@ -25,6 +25,9 @@ if [ -x /etc/init.d/xboxdownload_openwrt ]; then
 		fi
 	fi
 fi
+if [ "$status" = 0 ]; then
+	record_update_time installed-at || logger -t xboxdownload_openwrt 'Could not record installation time'
+fi
 rm -f /tmp/luci-indexcache.*
 /etc/init.d/rpcd reload >/dev/null 2>&1 || true
 exit "$status"

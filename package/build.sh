@@ -30,7 +30,8 @@ cp -R "$project/package/root/." "$stage/"
 # LuCI's resource version tracks LuCI itself. Give plugin assets fresh URLs when their content changes.
 resources="$stage/www/luci-static/resources"
 assets=xboxdownload_openwrt
-asset_hash=$(cd "$resources" && sha256sum "view/$assets.js" "$assets"/*.js "$assets/style.css" | sha256sum)
+cp "$project/docs/assets/logo.svg" "$resources/$assets/logo.svg"
+asset_hash=$(cd "$resources" && sha256sum "view/$assets.js" "$assets"/*.js "$assets/style.css" "$assets/logo.svg" | sha256sum)
 asset_path="${assets}_$(printf '%s' "$asset_hash" | cut -c1-12)"
 sed -e "s/'require $assets\./'require $asset_path./" -e "s|'$assets/|'$asset_path/|" \
 	"$resources/view/$assets.js" > "$resources/view/$asset_path.js"
@@ -39,12 +40,15 @@ mv "$resources/$assets" "$resources/$asset_path"
 sed -i "s/\"path\": \"$assets\"/\"path\": \"$asset_path\"/" \
 	"$stage/usr/share/luci/menu.d/luci-app-$assets.json"
 
+data="$stage/usr/share/$assets"
+mkdir -p "$data/release-keys"
+cp "$project/package/xboxdownload-openwrt-release.pem" "$data/release-keys/"
 find "$stage" -type d -exec chmod 0755 {} +
 find "$stage" -type f -exec chmod 0644 {} +
 chmod 0755 "$stage/etc/init.d/xboxdownload_openwrt" "$stage/usr/libexec/rpcd/xboxdownload_openwrt" \
-	"$stage/usr/share/xboxdownload_openwrt/http/cgi-bin/redirect" "$stage/usr/share/xboxdownload_openwrt/supervise"
+	"$data/http/cgi-bin/redirect" "$data/supervise" "$data/update"
 
-printf '%s\n' /etc/config/xboxdownload_openwrt > "$stage/lib/upgrade/keep.d/$name"
+printf '%s\n' /etc/config/xboxdownload_openwrt /etc/xboxdownload_openwrt/ > "$stage/lib/upgrade/keep.d/$name"
 metadata="$stage/lib/apk/packages/$name"
 printf '%s\n' /etc/config/xboxdownload_openwrt > "$metadata.conffiles"
 printf '/etc/config/xboxdownload_openwrt %s\n' "$(sha256sum "$stage/etc/config/xboxdownload_openwrt" | cut -d ' ' -f 1)" > "$metadata.conffiles_static"

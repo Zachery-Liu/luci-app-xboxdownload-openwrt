@@ -55,6 +55,26 @@ def configure_reply(state, call, requests):
         data = hints
     elif method == 'status':
         data = state.copy()
+    elif method == 'update_status':
+        data = {'current': '1.2.0-r0', 'phase': 'idle', 'installed_at': 1700000000,
+                'checked_at': state.get('_checked_at')}
+        if state.get('_updates'):
+            stages = state['_update_stages']
+            phase = stages.pop(0) if stages else state.get('_update_outcome', 'done')
+            if phase == 'reconnecting':
+                return {'jsonrpc': '2.0', 'id': call.get('id'), 'result': [7]}
+            data.update(phase=phase, target='1.2.1-r0', log='(1/1) Upgrading luci-app-xboxdownload-openwrt')
+            if phase == 'done':
+                data.update(current='1.2.1-r0', installed_at=1700000060)
+            elif phase == 'failed':
+                data['error'] = 'signature'
+    elif method == 'update_check':
+        state['_checked_at'] = 1700000030
+        data = {'current': '1.2.0-r0', 'latest': '1.2.1-r0', 'tag': 'v1.2.1', 'available': True,
+                'checked_at': state['_checked_at'], 'notes': '## 更新内容\n- 修复示例 <b>原文</b>'}
+    elif method == 'update_start':
+        state.setdefault('_updates', []).append(args['version'])
+        state['_update_stages'] = ['installing', 'reconnecting']
     elif method == 'configure':
         background = args.pop('background', 0)
         requests.append(args)
@@ -124,6 +144,8 @@ def serve_luci(page, theme, state, requests, loads, menu_script='menu-bootstrap'
             return route.fulfill(json=[reply(item) for item in call] if isinstance(call, list) else reply(call))
         if path == '/theme.css':
             return route.fulfill(content_type='text/css', body=theme)
+        if path == '/luci-static/resources/xboxdownload_openwrt/logo.svg':
+            return route.fulfill(path=str(root / 'docs/assets/logo.svg'), content_type='image/svg+xml')
         for directory in [local, openwrt]:
             file = directory / path.lstrip('/')
             if file.is_file():
@@ -213,10 +235,77 @@ def check_mobile_service(browser, theme):
         page.close()
 
 
+def check_about(browser, theme):
+    page = browser.new_page(viewport={'width': 320, 'height': 800})
+    state = initial.copy()
+    loads = []
+    serve_luci(page, theme, state, [], loads)
+    page.goto(base_url + '/service')
+    page.locator('#tabmenu').get_by_role('link', name='关于', exact=True).click()
+    about = page.locator('.xb-about')
+    project = 'https://github.com/Zachery-Liu/luci-app-xboxdownload-openwrt'
+    logs = about.locator('#cbi-xboxdownload-update-log')
+    notes = about.get_by_role('region', name='更新说明')
+    timestamps = about.locator('time')
+    expect(about.get_by_role('heading', name='Xbox 下载助手（OpenWrt）')).to_be_visible()
+    expect(about.get_by_role('link', name='Zachery Liu')).to_have_attribute('href', 'https://github.com/Zachery-Liu')
+    expect(about.get_by_role('link', name=project, exact=True)).to_have_attribute('href', project)
+    expect(about.get_by_text('1.2.0-r0', exact=True)).to_be_visible()
+    expect(timestamps.nth(0)).to_have_attribute('datetime', '2023-11-14T22:13:20.000Z')
+    expect(timestamps.nth(1)).to_have_text('从未检查')
+    expect(logs).to_be_hidden()
+    assert about.locator('img').evaluate('image => image.complete && image.naturalWidth > 0')
+    assert about.evaluate('pane => pane.scrollWidth === pane.clientWidth')
+    assert len(loads) == 1
+    about.get_by_role('button', name='检查更新').click()
+    expect(about.get_by_role('link', name='1.2.1-r0')).to_be_visible()
+    expect(timestamps.nth(1)).to_have_attribute('datetime', '2023-11-14T22:13:50.000Z')
+    expect(notes.get_by_role('heading', name='更新说明')).to_be_visible()
+    notes_body = notes.get_by_role('textbox', name='说明正文')
+    expect(notes_body).to_have_value('## 更新内容\n- 修复示例 <b>原文</b>')
+    expect(notes_body).to_have_attribute('readonly', '')
+    assert about.evaluate('pane => pane.scrollWidth === pane.clientWidth')
+    expect(logs).to_be_hidden()
+    about.get_by_role('button', name='安装更新').click()
+    modal = page.get_by_role('dialog')
+    expect(modal.get_by_text('将安装版本 1.2.1-r0', exact=False)).to_be_visible()
+    modal.get_by_role('button', name='取消').click()
+    assert '_updates' not in state
+    expect(logs).to_be_hidden()
+    state['_update_outcome'] = 'failed'
+    about.get_by_role('button', name='安装更新').click()
+    modal.get_by_role('button', name='确认安装').click()
+    expect(logs).to_be_visible()
+    expect(about.get_by_text('安装包未通过项目发布签名验证。')).to_be_visible()
+    expect(logs).to_be_hidden()
+    state['_update_outcome'] = 'done'
+    about.get_by_role('button', name='检查更新').click()
+    about.get_by_role('button', name='安装更新').click()
+    modal.get_by_role('button', name='确认安装').click()
+    expect(about.get_by_text('正在安装更新', exact=False)).to_be_visible()
+    expect(logs.get_by_role('heading', name='更新日志')).to_be_visible()
+    log_body = logs.get_by_role('textbox', name='安装输出')
+    expect(log_body).to_have_value('(1/1) Upgrading luci-app-xboxdownload-openwrt')
+    expect(log_body).to_have_attribute('readonly', '')
+    expect(about.get_by_text('正在重新连接 LuCI', exact=False)).to_be_visible()
+    expect(logs).to_be_visible()
+    expect(about.get_by_text('更新完成', exact=False)).to_be_visible()
+    expect(logs).to_be_hidden()
+    assert state['_updates'] == ['1.2.1-r0', '1.2.1-r0']
+    about.get_by_role('button', name='刷新页面').click()
+    expect(about.get_by_text('已更新到 1.2.1-r0。')).to_be_visible()
+    expect(timestamps.nth(0)).to_have_attribute('datetime', '2023-11-14T22:14:20.000Z')
+    expect(timestamps.nth(1)).to_have_attribute('datetime', '2023-11-14T22:13:50.000Z')
+    expect(about.get_by_role('button', name='检查更新')).to_be_enabled()
+    page.close()
+
+
 with sync_playwright() as playwright:
     browser = playwright.chromium.launch(channel=os.environ.get('PLAYWRIGHT_CHANNEL'), headless=True)
     check_mobile_service(browser, bootstrap)
     print('PASS: phone-width service fields fit and display full DNS addresses and device names')
+    check_about(browser, bootstrap)
+    print('PASS: About shows update times and release notes directly, confirms upgrades and reconnects during installation')
     context = browser.new_context()
 
     # Exercise the primary LuCI workflow before simulating configuration failures.

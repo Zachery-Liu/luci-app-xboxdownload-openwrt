@@ -1,0 +1,197 @@
+#!/bin/sh
+
+. /usr/share/libubox/jshn.sh
+. /usr/share/xboxdownload_openwrt/common.sh
+
+name=luci-app-xboxdownload-openwrt
+repo=Zachery-Liu/$name
+state="$RUNDIR/update.state"
+update_log="$RUNDIR/update.log"
+keys_dir="$DATA/release-keys"
+max_bytes=2097152
+umask 077
+
+valid_version() {
+	case "$1" in ''|*[!0-9.r-]*) return 1 ;; esac
+	printf '%s\n' "$1" | LC_ALL=C grep -Eq '^(0|[1-9][0-9]{0,8})\.(0|[1-9][0-9]{0,8})\.(0|[1-9][0-9]{0,8})-r(0|[1-9][0-9]{0,8})$'
+}
+
+installed_version() {
+	LC_ALL=C apk query --from installed --fields version "$name" 2>/dev/null | sed -n 's/^Version: //p'
+}
+
+download() {
+	curl -q --fail --silent --show-error --location --max-redirs 5 \
+		--proto '=https' --proto-redir '=https' --connect-timeout 4 \
+		--max-time "$1" --max-filesize "$2" --output "$3" "$4"
+}
+
+find_release() {
+	local entries key filename size digest status prerelease draft
+	check_error=metadata
+	tag=
+	notes=
+	json_load_file "$1" || return 1
+	json_get_vars tag_name prerelease draft
+	[ "$prerelease" = 0 ] && [ "$draft" = 0 ] || return 1
+	json_get_var tag tag_name
+	json_get_var notes body
+	case "$tag" in v*) ;; *) return 1 ;; esac
+	json_select assets && json_get_keys entries || return 1
+	latest=
+	for key in $entries; do
+		json_select "$key" || return 1
+		json_get_var filename name
+		json_get_var status state
+		json_get_vars size digest
+		json_select ..
+		case "$filename" in "$name"-*.apk) ;; *) continue ;; esac
+		version=${filename#"$name"-}
+		version=${version%.apk}
+		valid_version "$version" || continue
+		[ "$tag" = "v${version%-r*}" ] || [ "$tag" = "v$version" ] || continue
+		[ -z "$latest" ] && [ "$status" = uploaded ] || return 1
+		case "$size" in ''|*[!0-9]*) return 1 ;; esac
+		[ "${#size}" -le 7 ] && [ "$size" -gt 0 ] && [ "$size" -le "$max_bytes" ] || return 1
+		printf '%s\n' "$digest" | LC_ALL=C grep -Eq '^sha256:[0-9a-f]{64}$' || return 1
+		latest=$version
+		expected_size=$size
+		checksum=${digest#sha256:}
+	done
+	[ -n "$latest" ] || return 1
+	check_error=
+}
+
+lookup() {
+	check_error=network
+	download 8 98304 "$1" "https://api.github.com/repos/$repo/releases/latest" &&
+		find_release "$1"
+}
+
+reply() {
+	json_init
+	json_add_string error "$1"
+	json_add_string current "$current"
+	[ -z "$checked_at" ] || json_add_string checked_at "$checked_at"
+	json_dump
+}
+
+check() (
+	current=$(installed_version)
+	valid_version "$current" || { reply version; return; }
+	work=$(mktemp -d /tmp/xboxdownload-release.XXXXXX) || { reply storage; return; }
+	trap 'rm -rf "$work"' EXIT
+	lookup "$work/release.json" 2>/dev/null || error=$check_error
+	record_update_time checked-at || logger -t xboxdownload_openwrt 'Could not record update check time'
+	checked_at=$(cat "$UPDATE_HISTORY/checked-at" 2>/dev/null)
+	[ -z "$error" ] || { reply "$error"; return; }
+	comparison=$(apk version -t "$current" "$latest" 2>/dev/null)
+	case "$comparison" in '<') available=1 ;; '='|'>') available=0 ;; *) reply version; return ;; esac
+	json_init
+	json_add_string current "$current"
+	json_add_string latest "$latest"
+	json_add_string tag "$tag"
+	json_add_string checked_at "$checked_at"
+	json_add_string notes "$notes"
+	json_add_boolean available "$available"
+	json_dump
+)
+
+publish_state() {
+	local detail
+	case "$1" in
+		checking) detail="读取 GitHub 发布信息，目标版本 $target" ;;
+		downloading) detail="下载 $filename" ;;
+		verifying) detail='检查安装包的 SHA-256、发布签名和包版本' ;;
+		installing) detail='运行 APK 安装程序' ;;
+		done) detail="已成功更新到 $target" ;;
+		failed) detail="更新失败 ($2)" ;;
+	esac
+	printf '[%s] %s\n' "$(date '+%H:%M:%S')" "$detail" >> "$update_log"
+	printf '%s %s %s\n' "$1" "$target" "${2:-}" > "$state.tmp" && mv -f "$state.tmp" "$state"
+}
+
+status() (
+	phase=idle
+	[ ! -f "$state" ] || read -r phase target error < "$state"
+	case "$phase" in
+		checking|downloading|verifying|installing)
+			if flock -n -s 8; then
+				read -r phase target error < "$state"
+				case "$phase" in checking|downloading|verifying|installing) phase=failed; error=interrupted ;; esac
+			fi
+			;;
+	esac
+	json_init
+	json_add_string current "$(installed_version)"
+	json_add_string installed_at "$(cat "$UPDATE_HISTORY/installed-at" 2>/dev/null)"
+	json_add_string checked_at "$(cat "$UPDATE_HISTORY/checked-at" 2>/dev/null)"
+	json_add_string phase "$phase"
+	json_add_string target "$target"
+	json_add_string error "$error"
+	json_add_string log "$(tail -c 8192 "$update_log" 2>/dev/null)"
+	json_dump
+) 8>"$UPGRADE_LOCK"
+
+start() (
+	target=$1
+	valid_version "$target" || { reply invalid; return; }
+	flock -n -x 8 || { reply busy; return; }
+	mkdir -p "$RUNDIR" && : > "$update_log" && publish_state checking || { reply storage; return; }
+	# The worker keeps the lock and survives the package hook reloading rpcd.
+	setsid "$0" worker "$target" </dev/null >/dev/null 2>&1 &
+	reply ''
+) 8>"$UPGRADE_LOCK"
+
+worker() (
+	target=$1
+	work=$(mktemp -d /tmp/xboxdownload-release.XXXXXX) || { publish_state failed storage; return; }
+	trap 'rm -rf "$work"' EXIT
+	lookup "$work/release.json" 2>> "$update_log" || { publish_state failed "$check_error"; return; }
+	current=$(installed_version)
+	if [ "$latest" != "$target" ] || ! valid_version "$current" ||
+		[ "$(apk version -t "$current" "$target" 2>/dev/null)" != '<' ]; then
+		publish_state failed changed
+		return
+	fi
+	filename="$name-$target.apk"
+	artifact="$work/$filename"
+	publish_state downloading || return
+	download 45 "$expected_size" "$artifact" "https://github.com/$repo/releases/download/$tag/$filename" 2>> "$update_log" ||
+		{ publish_state failed download; return; }
+	publish_state verifying || return
+	hash=$(sha256sum < "$artifact") || { publish_state failed integrity; return; }
+	if [ "$(wc -c < "$artifact")" -ne "$expected_size" ] || [ "${hash%% *}" != "$checksum" ]; then
+		publish_state failed integrity
+		return
+	fi
+	apk --keys-dir "$keys_dir" verify "$artifact" >> "$update_log" 2>&1 ||
+		{ publish_state failed signature; return; }
+	info=$(LC_ALL=C apk --keys-dir "$keys_dir" adbdump "$artifact" 2>> "$update_log") ||
+		{ publish_state failed metadata; return; }
+	fields=$(printf '%s\n' "$info" | awk '
+		/^info:$/ { inside=1; next }
+		/^[^ ]/ { inside=0 }
+		inside && /^  name: / { name=$2 }
+		inside && /^  version: / { version=$2 }
+		inside && /^  arch: / { arch=$2 }
+		END { print name, version, arch }
+	')
+	[ "$fields" = "$name $target noarch" ] || { publish_state failed metadata; return; }
+	publish_state installing || return
+	apk --keys-dir "$keys_dir" --repositories-file /dev/null --no-network --wait 5 add "$artifact" >> "$update_log" 2>&1 ||
+		{ publish_state failed install; return; }
+	[ "$(installed_version)" = "$target" ] || { publish_state failed install; return; }
+	if [ "$(uci -q get xboxdownload_openwrt.main.enabled)" = 1 ] &&
+		! service_ready "$(cat "$RUNDIR/instance" 2>/dev/null)"; then
+		publish_state failed service
+		return
+	fi
+	publish_state 'done'
+)
+
+case "$1" in
+	check|status) "$1" ;;
+	start|worker) "$1" "$2" ;;
+	*) exit 1 ;;
+esac

@@ -6,14 +6,18 @@ on:
     tags: ['v*']
     paths:
       - 'package/**'
+      - 'install.sh'
       - 'tests/**'
+      - 'docs/assets/logo.svg'
       - '.github/workflows/**'
       - '.shellcheckrc'
       - '.github/dependabot.yml'
   pull_request:
     paths:
       - 'package/**'
+      - 'install.sh'
       - 'tests/**'
+      - 'docs/assets/logo.svg'
       - '.github/workflows/**'
       - '.shellcheckrc'
       - '.github/dependabot.yml'
@@ -27,6 +31,11 @@ permissions:
 concurrency:
   group: build-apk-${{ github.event_name == 'pull_request' && format('pr-{0}', github.event.pull_request.number) || github.ref }}
   cancel-in-progress: ${{ github.ref_type != 'tag' }}
+
+env:
+  IMAGEBUILDER_URL: https://downloads.openwrt.org/releases/25.12.6/targets/x86/64
+  IMAGEBUILDER_ARCHIVE: openwrt-imagebuilder-25.12.6-x86-64.Linux-x86_64.tar.zst
+  IMAGEBUILDER_SHA256: a792e29bd2233cda67a0823030bfb53c0b61fbb3836b2063e88adf89730d563b
 
 jobs:
   lint:
@@ -63,9 +72,6 @@ jobs:
     runs-on: ubuntu-24.04
     timeout-minutes: 10
     env:
-      IMAGEBUILDER_URL: https://downloads.openwrt.org/releases/25.12.6/targets/x86/64
-      IMAGEBUILDER_ARCHIVE: openwrt-imagebuilder-25.12.6-x86-64.Linux-x86_64.tar.zst
-      IMAGEBUILDER_SHA256: a792e29bd2233cda67a0823030bfb53c0b61fbb3836b2063e88adf89730d563b
       ROOTFS_ARCHIVE: openwrt-25.12.6-x86-64-generic-targz-rootfs.tar.gz
       ROOTFS_SHA256: d09cb68dd78a7f7b1c4ed788ad42162e07ec094b20f66b382cd4f91c9443970f
     steps:
@@ -120,6 +126,7 @@ jobs:
           printf '%s  %s\n' "$ROOTFS_SHA256" "$rootfs" | sha256sum --check
           apk_tool="$RUNNER_TEMP/${IMAGEBUILDER_ARCHIVE%.tar.zst}/staging_dir/host/bin/apk"
           sudo env OPENWRT_ROOTFS="$rootfs" APK_TOOL="$apk_tool" sh tests/install-package.sh dist/*.apk
+          sudo env OPENWRT_ROOTFS="$rootfs" APK_TOOL="$apk_tool" sh tests/update-package.sh dist/*.apk
           sudo env OPENWRT_ROOTFS="$rootfs" sh tests/reliability.sh
           sudo env OPENWRT_ROOTFS="$rootfs" sh tests/ipv6-devices.sh
 
@@ -168,35 +175,70 @@ jobs:
     needs: [build, arm64, lint]
     runs-on: ubuntu-24.04
     timeout-minutes: 5
+    environment: release
     permissions:
       contents: write
     steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
       - name: Download build artifact
         uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
         with:
           name: openwrt-apk
           path: dist
 
-      - name: Publish tagged release
+      - name: Install OpenWrt signing tool
+        shell: bash
+        run: |
+          if ! command -v zstd >/dev/null; then
+            sudo apt-get update
+            sudo apt-get install --no-install-recommends -y zstd
+          fi
+          archive="$RUNNER_TEMP/$IMAGEBUILDER_ARCHIVE"
+          curl --fail --silent --show-error --location --retry 3 \
+            --output "$archive" "$IMAGEBUILDER_URL/$IMAGEBUILDER_ARCHIVE"
+          printf '%s  %s\n' "$IMAGEBUILDER_SHA256" "$archive" | sha256sum --check
+          tar --zstd -xf "$archive" -C "$RUNNER_TEMP"
+
+      - name: Sign and verify release APK
+        id: sign
         env:
-          GH_TOKEN: ${{ github.token }}
-          RELEASE_TAG: ${{ github.ref_name }}
+          APK_SIGNING_KEY: ${{ secrets.APK_SIGNING_KEY }}
         shell: bash
         run: |
           cd dist
           sha256sum --check SHA256SUMS
-          tag_commit=$(gh api "repos/$GITHUB_REPOSITORY/commits/$RELEASE_TAG" --jq '.sha')
-          test "$tag_commit" = "$GITHUB_SHA"
           shopt -s nullglob
           packages=(luci-app-xboxdownload-openwrt-*.apk)
           test "${#packages[@]}" -eq 1
           package=${packages[0]}
+          apk_tool="$RUNNER_TEMP/${IMAGEBUILDER_ARCHIVE%.tar.zst}/staging_dir/host/bin/apk"
+          sh ../package/sign-release.sh "$apk_tool" "$package"
+          unset APK_SIGNING_KEY
+          sha256sum "$package" > "$package.sha256"
+          cp ../package/xboxdownload-openwrt-release.pem .
+          printf 'package=%s\n' "$package" >> "$GITHUB_OUTPUT"
+
+      - name: Publish tagged release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          RELEASE_TAG: ${{ github.ref_name }}
+          RELEASE_PACKAGE: ${{ steps.sign.outputs.package }}
+        shell: bash
+        run: |
+          cd dist
+          package=$RELEASE_PACKAGE
           checksum="$package.sha256"
-          cp SHA256SUMS "$checksum"
+          public_key=xboxdownload-openwrt-release.pem
+          sha256sum --check "$checksum"
+          tag_commit=$(gh api "repos/$GITHUB_REPOSITORY/commits/$RELEASE_TAG" --jq '.sha')
+          test "$tag_commit" = "$GITHUB_SHA"
           if gh release view "$RELEASE_TAG" --repo "$GITHUB_REPOSITORY" >/dev/null 2>&1; then
             remote=$(mktemp -d)
             trap 'rm -rf "$remote"' EXIT
-            for asset in "$package" "$checksum"; do
+            for asset in "$package" "$checksum" "$public_key"; do
               if ! gh release download "$RELEASE_TAG" --repo "$GITHUB_REPOSITORY" --pattern "$asset" --output "$remote/$asset" ||
                  ! cmp -s -- "$asset" "$remote/$asset"; then
                 echo "::error::Published release $RELEASE_TAG differs from this build. Publish under a new version or revision tag."
@@ -204,6 +246,6 @@ jobs:
               fi
             done
           else
-            gh release create "$RELEASE_TAG" "$package" "$checksum" \
+            gh release create "$RELEASE_TAG" "$package" "$checksum" "$public_key" \
               --repo "$GITHUB_REPOSITORY" --verify-tag --generate-notes
           fi

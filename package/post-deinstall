@@ -11,6 +11,9 @@ then
 	echo 'Could not remove Xbox Download firewall rules after package removal.' >&2
 	status=1
 fi
+history=/etc/xboxdownload_openwrt
+rm -f "$history/installed-at" "$history/checked-at"
+rmdir "$history" 2>/dev/null || true
 rm -f /tmp/luci-indexcache.*
 /etc/init.d/rpcd reload >/dev/null 2>&1 || true
 exit "$status"

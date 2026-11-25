@@ -266,6 +266,7 @@ configure_status() {
 
 configure() (
 	local request=$1 job background attempt=0
+	flock -n -s 8 || { result busy; return; }
 	flock -n -x 6 || { result busy; return; }
 	mkdir -p "$RUNDIR/jobs" || { result save; return; }
 	# Keep the latest results available to callers even if another tab submits a new request.
@@ -285,13 +286,13 @@ configure() (
 		return
 	fi
 	# Older LuCI pages can still receive a synchronous reply for quick operations.
-	exec 6>&-
+	exec 6>&- 8>&-
 	while [ "$attempt" -lt 15 ] && [ ! -f "$job/result" ]; do
 		attempt=$((attempt + 1))
 		sleep 1
 	done
 	if [ -f "$job/result" ]; then cat "$job/result"; else result apply_pending; fi
-) 6>"$CONFIG_LOCK"
+) 8>"$UPGRADE_LOCK" 6>"$CONFIG_LOCK"
 
 validate_addresses() {
 	local kind addresses validation type
@@ -547,9 +548,15 @@ probe() {
 }
 
 case "$1:$2" in
-	list:) echo '{"status":{},"configure":{"client":"","main_ip":"","legacy_ip":"","enabled":0,"extra":"","background":0},"configure_status":{"job":""},"validate_addresses":{"kind":"","addresses":""},"probe":{"group":"","ip":"","timeout":3,"sample":50,"family":4,"file":"","ping_only":0,"max_bytes":0},"import_nodes":{"source":"","channel":""},"clear_logs":{}}' ;;
+	list:) echo '{"status":{},"configure":{"client":"","main_ip":"","legacy_ip":"","enabled":0,"extra":"","background":0},"configure_status":{"job":""},"validate_addresses":{"kind":"","addresses":""},"probe":{"group":"","ip":"","timeout":3,"sample":50,"family":4,"file":"","ping_only":0,"max_bytes":0},"import_nodes":{"source":"","channel":""},"clear_logs":{},"update_status":{},"update_check":{},"update_start":{"version":""}}' ;;
 	call:status) status ;;
 	call:clear_logs) clear_logs ;;
+	call:update_check|call:update_status) exec "$DATA/update" "${2#update_}" ;;
+	call:update_start)
+		version=
+		json_load "$(cat)" && json_get_var version version || { result invalid; exit; }
+		exec "$DATA/update" start "$version"
+		;;
 	call:configure)
 		request=$(cat)
 		json_load "$request" || { result invalid; exit; }
