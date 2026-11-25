@@ -55,6 +55,19 @@ uclient-fetch -O "$installer" https://raw.githubusercontent.com/Zachery-Liu/luci
 sh "$installer"
 ```
 
+**jsDelivr 备用入口**
+
+GitHub Raw 访问失败时，可以通过 jsDelivr 下载固定提交中的安装脚本。命令会先校验脚本的 SHA-256，再执行。安装包和公钥仍从 GitHub Release 下载。
+
+```sh
+installer=$(mktemp /tmp/xboxdownload-installer.XXXXXX) &&
+curl -fsSL -o "$installer" https://cdn.jsdelivr.net/gh/Zachery-Liu/luci-app-xboxdownload-openwrt@e3011026f18c3aa5c22c30f8b0f1f21bd8849b51/install.sh &&
+printf '%s  %s\n' 'ac1258082ab097d5d6c79d43241b7d79fea28ac50223b42aaa05043ab6f9bfec' "$installer" | sha256sum -c - &&
+sh "$installer"
+```
+
+系统未安装 curl 时，可以将 jsDelivr 命令里的 `curl -fsSL -o` 改成 `uclient-fetch -O`。
+
 也可以从 [GitHub Releases](https://github.com/Zachery-Liu/luci-app-xboxdownload-openwrt/releases) 下载 APK 手动安装。首次安装签名版本时，将核对过的[项目公钥](package/xboxdownload-openwrt-release.pem)放入路由器的 `/etc/apk/keys/`，再运行 `apk add /tmp/实际文件名.apk`。安装 v1.1.0 等旧版时，请参照对应 Release 的说明。
 
 1. 在 LuCI 打开「服务 → Xbox 下载助手」，在「设备」页添加 Xbox，点击「保存并应用」，再点击「启动服务」。建议给 Xbox 配置 DHCP 静态租约，避免换 IP 后加速失效。
