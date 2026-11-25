@@ -141,30 +141,29 @@ fi
 grep -Fq 'APK 签名验证失败' "$lab/install.log"
 [ ! -e "$trusted_key" ]
 release "$lab/$filename" "$(sha256sum "$lab/$filename" | cut -d ' ' -f1)"
-# The isolated rootfs has no mount table. Simulate both free-space results.
+# The isolated rootfs has no mount table. Exercise its writable overlay and a zero reading.
+mkdir -p "$root/overlay/upper"
 df_path=$(chroot "$root" sh -c 'command -v df')
 rm -f "$root$df_path"
 cat > "$root$df_path" <<'EOF'
 #!/bin/sh
+[ "$*" = '-Pk /overlay/upper' ] || exit 1
 available=1048576
 [ ! -f /tmp/space-limited ] || available=0
 printf 'Filesystem 1024-blocks Used Available Capacity Mounted on\n'
-printf 'overlay 1048576 0 %s 0%% /\n' "$available"
+printf 'overlay 1048576 0 %s 0%% /overlay\n' "$available"
 EOF
 chmod +x "$root$df_path"
 touch "$root/tmp/space-limited"
-if chroot "$root" sh /tmp/install.sh > "$lab/install.log" 2>&1; then
-	echo 'The installer accepted insufficient disk space' >&2
-	exit 1
-fi
-grep -Fq '安装分区空间不足，剩余 0 KiB' "$lab/install.log"
-[ ! -e "$trusted_key" ]
+chroot "$root" sh /tmp/install.sh > "$lab/install.log"
+grep -Fxq '  [提示] 无法确认可写空间，继续由 apk 安装。' "$lab/install.log"
+grep -Fxq "安装完成  $version" "$lab/install.log"
 rm -f "$root/tmp/space-limited"
 chroot "$root" sh /tmp/install.sh > "$lab/install.log"
 cat "$lab/install.log"
 grep -Fxq '  [通过] 下载工具 uclient-fetch' "$lab/install.log"
 grep -Fxq '  [通过] APK 项目签名' "$lab/install.log"
-grep -Fq '  [通过] 安装分区剩余 1048576 KiB' "$lab/install.log"
+grep -Fq '  [通过] 可写分区剩余 1048576 KiB' "$lab/install.log"
 grep -Fxq '[5/5] 安装 APK' "$lab/install.log"
 grep -Fxq "安装完成  $version" "$lab/install.log"
 cmp "$trusted_key" "$fixture_key"

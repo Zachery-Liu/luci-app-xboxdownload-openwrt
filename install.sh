@@ -138,14 +138,18 @@ install_main() {
 	[ "$fields" = "$name $version noarch" ] || fail 'APK 的包名、版本或架构与发布信息不一致。'
 	passed '包名、版本和架构匹配（noarch）'
 	needed_bytes=$(printf '%s\n' "$info" | awk '/^  installed-size: [0-9]+$/ { print $2; exit }')
-	free_kib=$(df -Pk /usr 2>/dev/null | awk 'NR == 2 && $4 ~ /^[0-9]+$/ { print $4 }')
-	if [ -n "$needed_bytes" ] && [ -n "$free_kib" ]; then
-		needed_kib=$(((needed_bytes + 1023) / 1024))
-		[ "$needed_kib" -le "$free_kib" ] ||
-			fail "安装分区空间不足，剩余 $free_kib KiB，插件需要 $needed_kib KiB。"
-		passed "安装分区剩余 $free_kib KiB，插件需要 $needed_kib KiB"
+	space_path=/
+	[ ! -d /overlay/upper ] || space_path=/overlay/upper
+	free_kib=$(df -Pk "$space_path" 2>/dev/null | awk 'NR == 2 && $NF != "/rom" && $4 ~ /^[0-9]+$/ { print $4 }')
+	if [ -z "$needed_bytes" ] || [ "${free_kib:-0}" -eq 0 ]; then
+		printf '%s\n' '  [提示] 无法确认可写空间，继续由 apk 安装。'
 	else
-		printf '%s\n' '  [提示] 无法读取安装分区空间，交由 apk 检查。'
+		needed_kib=$(((needed_bytes + 1023) / 1024))
+		if [ "$needed_kib" -gt "$free_kib" ]; then
+			printf '  [提示] 可写分区剩余 %s KiB，插件完整占用 %s KiB，继续由 apk 安装。\n' "$free_kib" "$needed_kib"
+		else
+			passed "可写分区剩余 $free_kib KiB，插件完整占用 $needed_kib KiB"
+		fi
 	fi
 
 	step 5/5 '安装 APK'
