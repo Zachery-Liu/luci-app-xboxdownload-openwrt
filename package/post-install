@@ -1,7 +1,11 @@
 #!/bin/sh
 
 [ -z "$IPKG_INSTROOT" ] && [ "$IPKG_NO_SCRIPT" != 1 ] || exit 0
-backup=/var/run/xboxdownload_openwrt/legacy.uci
+. /usr/share/xboxdownload_openwrt/common.sh
+exec 6>"$CONFIG_LOCK" || exit 1
+flock -x 6 || exit 1
+backup="$RUNDIR/legacy.uci"
+status=0
 if [ -x /etc/init.d/xboxdownload_openwrt ]; then
 	if [ -s "$backup" ]; then
 		legacy='xbox''accel'
@@ -10,10 +14,17 @@ if [ -x /etc/init.d/xboxdownload_openwrt ]; then
 		rm -f "$backup" "/etc/config/$legacy"
 	fi
 	chown root:root /etc/config/xboxdownload_openwrt || exit 1
-	/etc/init.d/xboxdownload_openwrt enable
+	/etc/init.d/xboxdownload_openwrt enable || status=1
 	if [ "$(uci -q get xboxdownload_openwrt.main.enabled)" = 1 ]; then
-		/etc/init.d/xboxdownload_openwrt restart
+		if ! restart_and_wait /etc/init.d/xboxdownload_openwrt; then
+			detail=$(cat "$RUNDIR/error" 2>/dev/null)
+			message="Xbox Download did not become ready after installation or upgrade${detail:+: $detail}"
+			printf '%s\n' "$message" >&2
+			logger -t xboxdownload_openwrt "$message"
+			status=1
+		fi
 	fi
 fi
 rm -f /tmp/luci-indexcache.*
 /etc/init.d/rpcd reload >/dev/null 2>&1 || true
+exit "$status"

@@ -44,8 +44,14 @@
 }
 
 :is(.xb-app, .xb-device-editor) .xb-help-button {
-	width: 22px;
-	height: 22px;
+	display: inline-grid;
+	place-items: center;
+	box-sizing: border-box;
+	flex: none;
+	inline-size: 2rem;
+	min-inline-size: 2rem;
+	block-size: 2rem;
+	min-block-size: 2rem;
 	padding: 0;
 	font: inherit;
 	line-height: 1;
@@ -119,10 +125,17 @@
 	min-width: 0;
 }
 
-.xb-app .xb-overview-values input {
-	width: 38ch;
-	max-width: 100%;
+.xb-app .xb-overview-value {
+	box-sizing: border-box;
+	inline-size: 38ch;
+	max-inline-size: 100%;
+	padding: .35em .75em;
+	border: 1px solid var(--border-color-high, color-mix(in srgb, currentColor 22%, transparent));
+	border-radius: .25rem;
 	font-variant-numeric: tabular-nums;
+	line-height: 1.5;
+	overflow-wrap: anywhere;
+	user-select: text;
 }
 
 .xb-app .xb-row + .xb-overview-values {
@@ -281,6 +294,31 @@
 	display: none;
 }
 
+@media (max-width: 767px) {
+	.xb-app :is(#cbi-xboxdownload-overview, #cbi-xboxdownload-downloads) .cbi-value:not(.hidden) {
+		display: block;
+	}
+	.xb-app :is(#cbi-xboxdownload-overview, #cbi-xboxdownload-downloads) .cbi-value > .cbi-value-title {
+		display: block;
+		float: none;
+		inline-size: auto;
+		padding-inline: 0;
+		text-align: start;
+	}
+	.xb-app :is(#cbi-xboxdownload-overview, #cbi-xboxdownload-downloads) .cbi-value > .cbi-value-field {
+		display: block;
+		margin-inline: 0;
+		padding-inline: 0;
+	}
+	.xb-app #cbi-xboxdownload-downloads :is(input, select, .cbi-dropdown) {
+		min-inline-size: 0;
+		max-inline-size: 100%;
+	}
+	.xb-overview .xb-row > .xb-overview-values {
+		inline-size: 100%;
+	}
+}
+
 @media (max-width: 560px) {
 	.xb-device-editor .cbi-value:not(.hidden) { display: block; }
 	.xb-device-editor .cbi-value-title {
@@ -292,7 +330,7 @@
 	.xb-device-editor .cbi-value-field { display: block; margin-inline-start: 0; padding-inline: 0; }
 	.xb-app .xb-node-table { min-width: 0; }
 	.xb-app .xb-node-table :is(td, th) { padding: 6px; }
-	.xb-app .xb-node-table :is(td, th):nth-child(5) { display: none; }
+	.xb-app .xb-node-table :is(td, th):is(:nth-child(5), :nth-child(6)) { display: none; }
 	.xb-app .xb-mobile-delay { display: block; }
 	.xb-app :is(.xb-ip, .xb-best-node) { white-space: normal; overflow-wrap: anywhere; }
 	.xb-app .xb-node-table .xb-rate { white-space: normal; }

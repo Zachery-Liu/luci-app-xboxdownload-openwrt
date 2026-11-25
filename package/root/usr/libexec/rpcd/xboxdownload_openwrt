@@ -10,12 +10,37 @@ INIT=/etc/init.d/xboxdownload_openwrt
 result() {
 	json_init
 	json_add_string error "$1"
+	[ "$#" -lt 2 ] || json_add_string bytes "$2"
 	json_dump
+}
+
+log_ipv6_clients() {
+	local macs
+	[ -n "$lan_dev" ] || return 0
+	macs=$(ipv6_policy_macs dns)
+	[ -n "$macs" ] || return 0
+	# A selected device can use multiple IPv6 addresses on the LAN.
+	ip -6 neigh show dev "$lan_dev" 2>/dev/null |
+		awk -v macs="$macs" '
+			BEGIN {
+				n = split(tolower(macs), list, /[,[:space:]]+/)
+				for (i = 1; i <= n; i++) selected[list[i]] = 1
+			}
+			index($1, ":") && $NF !~ /^(FAILED|INCOMPLETE)$/ {
+				for (i = 2; i < NF; i++) if ($i == "lladdr" && tolower($(i+1)) in selected) {
+					print tolower($1)
+					break
+				}
+			}'
 }
 
 read_logs() {
 	logread -l 256 2>/dev/null |
-		awk -v clients=",$client," '
+		awk -v clients=",$client," -v clients6="$(log_ipv6_clients)" '
+			BEGIN {
+				n = split(clients6, list, /[[:space:]]+/)
+				for (i = 1; i <= n; i++) selected6[list[i]] = 1
+			}
 			/xboxdownload_openwrt: LOG RESET$/ { count = 0; next }
 			/xboxdownload_openwrt: HTTP 302 / && NF >= 11 {
 				prefix = "xboxdownload_openwrt: HTTP 302 "
@@ -26,7 +51,9 @@ read_logs() {
 			/local5\.[^ ]+ dnsmasq\[/ {
 				for (i = 8; i + 3 <= NF; i++) if ($i ~ /^query\[[^]]+\]$/ && $(i+2) == "from") {
 					remote = $(i+3)
-					if (index(clients, "," remote ","))
+					address = tolower(remote)
+					sub(/%.*/, "", address)
+					if (index(clients, "," remote ",") || address in selected6)
 						entries[(count++) % 32] = $4 "\tDNS " substr($i, 7, length($i)-7) "\t" remote "\t" $(i+1)
 					break
 				}
@@ -58,8 +85,7 @@ status() {
 	dns=false
 	http=false
 	running=0
-	if [ "$service" = true ] && [ -s "$RUNDIR/ready" ] &&
-		nft list table ip xboxdownload_openwrt >/dev/null 2>&1; then
+	if [ "$service" = true ] && service_ready "$(cat "$RUNDIR/instance" 2>/dev/null)"; then
 		running=1
 		dns=true
 		[ "$mode" != redirect ] || http=true
@@ -113,22 +139,10 @@ write_settings() {
 	} | uci -q batch && uci -q commit xboxdownload_openwrt
 }
 
-wait_for_service() {
-	local attempt
-	for attempt in 1 2 3 4 5 6 7 8 9 10; do
-		if [ -s "$RUNDIR/ready" ] && cmp -s "$RUNDIR/ready" "$RUNDIR/instance"; then
-			return 0
-		fi
-		[ ! -s "$RUNDIR/error" ] || return 1
-		sleep 1
-	done
-	return 1
-}
-
 apply_service_state() {
 	local rules
 	if [ "$1" = 1 ]; then
-		"$INIT" restart >/dev/null 2>&1 && wait_for_service
+		restart_and_wait "$INIT" >/dev/null 2>&1
 		return
 	fi
 	"$INIT" stop >/dev/null 2>&1 || return 1
@@ -137,10 +151,8 @@ apply_service_state() {
 	! printf '%s\n' "$rules" | grep -Eq '^table (ip xboxdownload_openwrt|inet xboxdownload_openwrt_ipv6)$'
 }
 
-configure() {
+configure_settings() {
 	local validation previous previous_enabled extra key type apply_error rollback_error detail
-	lock /var/lock/xboxdownload_openwrt.lock || { result busy; return; }
-	trap 'lock -u /var/lock/xboxdownload_openwrt.lock' EXIT
 	load_settings
 	previous_enabled=$enabled
 	json_get_vars extra
@@ -220,35 +232,98 @@ configure() {
 	result "$rollback_error"
 }
 
+configuration_worker() {
+	local job=$1
+	if json_load "$(cat "$job/request")"; then
+		configure_settings
+	else
+		result invalid
+	fi > "$job/result.tmp"
+	mv -f "$job/result.tmp" "$job/result"
+	rm -f "$job/request"
+}
+
+configure_status() {
+	local job
+	json_get_var job job
+	case "$job" in
+		''|*[!a-zA-Z0-9]*) result job_lost; return ;;
+	esac
+	[ "${#job}" = 8 ] || { result job_lost; return; }
+	job="$RUNDIR/jobs/$job"
+	if [ -f "$job/result" ]; then
+		cat "$job/result"
+	elif [ -f "$job/request" ] && ! (flock -n -x 6) 6>"$CONFIG_LOCK"; then
+		json_init
+		json_add_boolean pending 1
+		json_dump
+	elif [ -f "$job/result" ]; then
+		cat "$job/result"
+	else
+		result job_lost
+	fi
+}
+
+configure() (
+	local request=$1 job background attempt=0
+	flock -n -x 6 || { result busy; return; }
+	mkdir -p "$RUNDIR/jobs" || { result save; return; }
+	# Keep the latest results available to callers even if another tab submits a new request.
+	ls -1t "$RUNDIR/jobs" | sed -n '25,$p' | while read -r job; do
+		rm -f "$RUNDIR/jobs/$job/request" "$RUNDIR/jobs/$job/result" "$RUNDIR/jobs/$job/result.tmp"
+		rmdir "$RUNDIR/jobs/$job"
+	done
+	job=$(mktemp -d "$RUNDIR/jobs/XXXXXXXX") || { result save; return; }
+	printf '%s\n' "$request" > "$job/request" || { result save; return; }
+	json_get_var background background
+	# The worker inherits the transaction lock and owns the rollback even if rpcd kills its caller.
+	"$0" worker "$job" </dev/null >/dev/null 2>&1 &
+	if [ "$background" = 1 ]; then
+		json_init
+		json_add_string job "${job##*/}"
+		json_dump
+		return
+	fi
+	# Older LuCI pages can still receive a synchronous reply for quick operations.
+	exec 6>&-
+	while [ "$attempt" -lt 15 ] && [ ! -f "$job/result" ]; do
+		attempt=$((attempt + 1))
+		sleep 1
+	done
+	if [ -f "$job/result" ]; then cat "$job/result"; else result apply_pending; fi
+) 6>"$CONFIG_LOCK"
+
+validate_addresses() {
+	local kind addresses validation type
+	json_get_type type addresses && [ "$type" = string ] || { result invalid; return; }
+	json_get_vars kind addresses
+	case "$kind" in
+		nodes)
+			if [ -n "$addresses" ] && [ "${#addresses}" -le 1024 ] && address_check nodes "$addresses"; then
+				result ''
+			else
+				result cdn
+			fi
+			;;
+		client)
+			case "$addresses" in ''|*[!0-9.]*) result client; return ;; esac
+			[ "${#addresses}" -le 15 ] && client_ipv4 "$addresses" || { result client; return; }
+			# validate_lan_addresses reads lan_subnets from the shared helpers.
+			# shellcheck disable=SC2034
+			network_get_subnets lan_subnets lan || lan_subnets=
+			validation=$(validate_lan_addresses "$addresses")
+			result "$validation"
+			;;
+		*) result invalid ;;
+	esac
+}
+
 download_nodes() {
 	curl -q -fsS --proto '=https' --noproxy '*' -H 'Cache-Control: no-cache' --connect-timeout 3 --max-time 8 \
 		--max-filesize 65536 -o "$raw" "$1" || return 1
-	awk -v group="$keyword" '
-		{ sub(/\r$/, "") }
-		NR == 1 { if ($0 != group) exit 1; next }
-		{
-			ip = tolower($1)
-			if (seen[ip]++) next
-			if (group == "AkamaiV6") {
-				if (ip !~ /^[23][0-9a-f][0-9a-f][0-9a-f]:[0-9a-f:]+$/ || ip ~ /:::/) next
-			} else {
-				if (ip !~ /^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+$/) next
-				split(ip, octets, ".")
-				for (i = 1; i <= 4; i++)
-					if (length(octets[i]) > 3 || octets[i] > 255 ||
-						(length(octets[i]) > 1 && octets[i] ~ /^0/)) next
-			}
-			location = ""
-			if (match($0, /\([^()]*\)[[:space:]]*$/)) {
-				location = substr($0, RSTART + 1, RLENGTH - 1)
-				sub(/\)[[:space:]]*$/, "", location)
-				gsub(/[[:cntrl:]]/, " ", location)
-			}
-			printf "%s\t%s\n", ip, location
-			count++
-		}
-		END { if (!count) exit 1 }
-	' "$raw" > "$parsed" && mv -f "$parsed" "$cache"
+	LC_ALL=C awk -v check=import -v group="$keyword" -v family="$family" \
+		-f "$DATA/addresses.awk" "$raw" > "$parsed" &&
+		[ -s "$parsed" ] && mv -f "$parsed" "$cache"
 }
 
 import_nodes() {
@@ -267,6 +342,8 @@ import_nodes() {
 		ps) keyword=Ps ;;
 		*) result invalid; return ;;
 	esac
+	family=4
+	[ "$source" != akamai6 ] || family=6
 
 	cache_dir="$RUNDIR/nodes"
 	mkdir -p "$cache_dir" || { result import; return; }
@@ -288,9 +365,11 @@ import_nodes() {
 		return
 	fi
 
+	nodes=$(LC_ALL=C awk -v check=cache -v family="$family" -f "$DATA/addresses.awk" "$cache")
+	[ -n "$nodes" ] || { result import; return; }
 	json_init
 	json_add_string origin "$origin"
-	json_add_string nodes "$(cat "$cache")"
+	json_add_string nodes "$nodes"
 	json_dump
 }
 
@@ -354,6 +433,7 @@ app_ping_fallback() {
 	EOF
 	json_init
 	json_add_string error sample
+	json_add_string bytes 0
 	json_add_string ip "$ip"
 	json_add_string ttl "$ttl"
 	json_add_string rtt "$rtt"
@@ -361,16 +441,23 @@ app_ping_fallback() {
 }
 
 probe() {
-	json_get_vars group ip timeout sample family file ping_only
+	json_get_vars group ip timeout sample family file ping_only max_bytes
 	case "$group" in main|legacy|global|app|ps|ns|ea) ;; *) result invalid; return ;; esac
 	case "$group:$ping_only" in *:|*:0|app:1) ;; *) result invalid; return ;; esac
+	case "$max_bytes" in
+		''|0) max_bytes=0 ;;
+		0*|*[!0-9]*) result invalid; return ;;
+	esac
+	[ "${#max_bytes}" -le 8 ] || { result invalid; return; }
 	if [ -n "$file" ]; then
 		case "$group:$file" in
 			main:default|main:halo|main:forza|main:gears) ;;
 			*) result invalid; return ;;
 		esac
 	fi
-	[ -z "$ip" ] || node_ip "$ip" || { result cdn; return; }
+	[ -z "$ip" ] || node_ip "$ip" || { result cdn 0; return; }
+	case "$group:$family" in main:6|legacy:6) result cdn_family 0; return ;; esac
+	node_family_supported "${group}_ip" "$ip" || { result cdn_family 0; return; }
 	mkdir -p "$RUNDIR" || { result busy; return; }
 	lock -n "$RUNDIR/probe.lock" 2>/dev/null || { result probe_busy; return; }
 	trap 'lock -u "$RUNDIR/probe.lock"' EXIT
@@ -379,6 +466,7 @@ probe() {
 	port=80
 	user_agent=XboxDownload
 	url=
+	sample_id=
 	case "$group" in
 		main)
 			host=assets1.xboxlive.cn
@@ -405,12 +493,18 @@ probe() {
 			authority="${url#*://}"
 			host="${authority%%/*}"
 			case "$url" in https://*) port=443 ;; esac
+			# Signed sample URLs stay on the router. The digest lets LuCI group comparable results.
+			sample_id=$(printf '%s' "$url" | sha256sum)
+			sample_id=${sample_id%% *}
 			;;
 	esac
 	url=${url:-http://$host$path}
 	case "$timeout" in 3|5|10) ;; *) timeout=3 ;; esac
 	case "$sample" in 1|8|30|32|50) ;; *) sample=50 ;; esac
 	limit=$(( sample * 1048576 ))
+	if [ "$max_bytes" -gt 0 ] && [ "$max_bytes" -lt "$limit" ]; then
+		limit=$max_bytes
+	fi
 	family_flag=-4
 	case "$ip:$family" in *:*:*) family_flag=-6 ;; :6) family_flag=-6 ;; esac
 	set --
@@ -423,16 +517,17 @@ probe() {
 	metrics=$(curl -q "$family_flag" -s --noproxy '*' --connect-timeout 3 --max-time "$timeout" \
 		-A "$user_agent" \
 		--range "0-$(( limit - 1 ))" --max-filesize "$limit" -o /dev/null \
-		-w '%{http_code} %{remote_ip} %{time_connect} %{size_download} %{speed_download}' \
+		-w '%{http_code}|%{remote_ip}|%{time_connect}|%{size_download}|%{speed_download}|%{time_namelookup}' \
 		"$@" "$url")
 	rc=$?
-	read -r code remote connect bytes speed <<-EOF
+	IFS='|' read -r code remote connect bytes speed namelookup <<-EOF
 		$metrics
 	EOF
+	[ -z "$remote" ] || node_ip "$remote" || { result cdn "$bytes"; return; }
 	ping_ip=${ip:-$remote}
 	ttl=
 	rtt=
-	if node_ip "$ping_ip"; then
+	if [ -n "$ping_ip" ]; then
 		read -r ttl rtt <<-EOF
 			$(ping_metrics "$ping_ip")
 		EOF
@@ -442,6 +537,8 @@ probe() {
 	json_add_string code "$code"
 	json_add_string ip "$remote"
 	json_add_string connect "$connect"
+	json_add_string namelookup "$namelookup"
+	[ -z "$sample_id" ] || json_add_string sample_id "$sample_id"
 	json_add_string bytes "$bytes"
 	json_add_string speed "$speed"
 	json_add_string ttl "$ttl"
@@ -450,12 +547,18 @@ probe() {
 }
 
 case "$1:$2" in
-	list:) echo '{"status":{},"configure":{"client":"","main_ip":"","legacy_ip":"","enabled":0,"extra":""},"probe":{"group":"","ip":"","timeout":3,"sample":50,"family":4,"file":"","ping_only":0},"import_nodes":{"source":"","channel":""},"clear_logs":{}}' ;;
+	list:) echo '{"status":{},"configure":{"client":"","main_ip":"","legacy_ip":"","enabled":0,"extra":"","background":0},"configure_status":{"job":""},"validate_addresses":{"kind":"","addresses":""},"probe":{"group":"","ip":"","timeout":3,"sample":50,"family":4,"file":"","ping_only":0,"max_bytes":0},"import_nodes":{"source":"","channel":""},"clear_logs":{}}' ;;
 	call:status) status ;;
 	call:clear_logs) clear_logs ;;
-	call:configure|call:probe|call:import_nodes)
+	call:configure)
+		request=$(cat)
+		json_load "$request" || { result invalid; exit; }
+		configure "$request"
+		;;
+	call:configure_status|call:validate_addresses|call:probe|call:import_nodes)
 		json_load "$(cat)" || { result invalid; exit; }
 		"$2"
 		;;
+	worker:*) configuration_worker "$2" ;;
 	*) exit 1 ;;
 esac

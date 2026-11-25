@@ -12,29 +12,41 @@ active_upstream_state=normal
 local_dns="127.0.0.1:$DNS_PORT"
 local_dns6=${5:-}
 probe_domain=${6:-}
+use_default_upstream=${7:-1}
 supervisor_pid=$$
 failure='A download service stopped; system DNS restored'
 
-current_instance() {
+current_token() {
 	[ "$(cat "$RUNDIR/instance" 2>/dev/null)" = "$token" ]
+}
+
+current_instance() {
+	current_token && [ "$(cat "$RUNDIR/owner" 2>/dev/null)" = "$lease" ]
+}
+
+remove_owned_rules() {
+	local message=$1
+	current_instance || return 0
+	rm -f "$RUNDIR/ready" "$UPSTREAM_STATE"
+	if clear_rules; then
+		rm -f "$RUNDIR/owner"
+	else
+		message=$RULE_CLEANUP_ERROR
+	fi
+	printf '%s\n' "$message" > "$RUNDIR/error"
+	logger -t xboxdownload_openwrt "$message"
 }
 
 cleanup() {
 	trap '' USR1 USR2 TERM INT
-	[ -z "$listener_error" ] || failure=$listener_error
-	if lock "$SERVICE_LOCK"; then
-		if current_instance; then
-			rm -f "$RUNDIR/ready" "$UPSTREAM_STATE"
-			clear_rules || failure=$RULE_CLEANUP_ERROR
-			printf '%s\n' "$failure" > "$RUNDIR/error"
-			logger -t xboxdownload_openwrt "$failure"
-		fi
-		lock -u "$SERVICE_LOCK"
-	fi
-	[ -z "$dns_pid" ] || kill "$dns_pid" 2>/dev/null
-	[ -z "$http_pid" ] || kill "$http_pid" 2>/dev/null
+	with_service_lock remove_owned_rules "${listener_error:-$failure}"
 	[ -z "$timer_pid" ] || kill "$timer_pid" 2>/dev/null
-	wait
+	exec 9>&-
+	if [ -n "$guard_pid" ]; then
+		wait "$guard_pid"
+	else
+		rm -f "$lease"
+	fi
 }
 
 watch() {
@@ -45,8 +57,42 @@ watch() {
 	child_pid=$!
 	trap 'kill "$child_pid" 2>/dev/null; wait "$child_pid"; exit' TERM INT
 	wait "$child_pid"
-	kill "-$signal" "$supervisor_pid" 2>/dev/null
+	[ ! -e "$lease.started" ] || kill "-$signal" "$supervisor_pid" 2>/dev/null
 }
+
+cleanup_listeners() {
+	rm -f "$lease.started"
+	with_service_lock remove_owned_rules 'Supervisor exited unexpectedly; system DNS restored'
+	[ -z "$dns_pid" ] || kill $dns_pid 2>/dev/null
+	[ -z "$http_pid" ] || kill "$http_pid" 2>/dev/null
+	wait
+	rm -f "$lease"
+}
+
+# The supervisor holds a private flock. Its release wakes this guard even after SIGKILL.
+# Serialize the listeners across respawns so a new instance cannot probe old sockets.
+guard_listeners() (
+	trap - EXIT USR1 USR2
+	flock -x 7 || exit 1
+	current_instance || { rm -f "$lease"; exit 0; }
+	trap cleanup_listeners EXIT
+	trap 'exit 0' TERM INT
+	watch USR1 /usr/sbin/dnsmasq -k -C "$RUNDIR/dnsmasq.conf" 7>&- &
+	dns_pid=$!
+	if [ -s "$DNS_PROFILES" ]; then
+		while read -r port _address _mac _policy _upstream; do
+			watch USR1 /usr/sbin/dnsmasq -k -C "$RUNDIR/dnsmasq.$port.conf" 7>&- &
+			dns_pid="$dns_pid $!"
+		done < "$DNS_PROFILES"
+	fi
+	if [ "$mode" = redirect ]; then
+		watch USR2 /usr/sbin/uhttpd -f -p "$lan_ip:$HTTP_PORT" \
+			-h "$DATA/http" -D -x /cgi-bin -E /cgi-bin/redirect -T 5 -t 5 -n 4 -N 32 7>&- &
+		http_pid=$!
+	fi
+	: > "$lease.started"
+	flock -x 9 9<"$lease"
+) 7>"$LISTENER_LOCK"
 
 dns_probe() {
 	/bin/busybox nslookup -timeout=1 -retry=1 -type=A "$HEALTH_HOST" "$1" 2>/dev/null |
@@ -56,8 +102,42 @@ dns_probe() {
 }
 
 dns_ready() {
-	kill -0 "$dns_pid" 2>/dev/null && dns_probe "$local_dns" &&
+	[ -e "$lease.started" ] && dns_probe "$lan_ip:$DNS_PORT" &&
 		{ [ -z "$local_dns6" ] || dns_probe "$local_dns6"; }
+}
+
+# Send a length-prefixed A query for the local health record over TCP.
+dns_tcp_probe() {
+	local label=${HEALTH_HOST%%.*} suffix=${HEALTH_HOST#*.}
+	# Header (12), encoded name (two extra bytes), type and class (4).
+	local query_size=$((18 + ${#HEALTH_HOST}))
+	{
+		printf '\000%b\130\104\001\000\000\001\000\000\000\000\000\000' \
+			"$(printf '\\0%03o' "$query_size")"
+		printf '%b%s%b%s\000\000\001\000\001' \
+			"$(printf '\\0%03o' "${#label}")" "$label" "$(printf '\\0%03o' "${#suffix}")" "$suffix"
+		sleep 1
+	} | read_tcp_response "$1" "${2:-$DNS_PORT}" 3<&0 | hexdump -v -e '1/1 "%u\n"' |
+		awk -v ip="$lan_ip" -v question_end="$((query_size + 2))" '
+			{ b[NR] = $1 }
+			END {
+				if (NR != 2 + 256*b[1] + b[2] || b[3] != 88 || b[4] != 68 ||
+				    b[5] < 128 || b[6] % 16 != 0 || b[7] != 0 || b[8] != 1 ||
+				    b[9] != 0 || b[10] != 1) exit 1
+				# Skip the answer name, either a sequence of labels or a compression pointer.
+				p = question_end + 1
+				while (p <= NR && b[p] > 0 && b[p] <= 63) p += b[p] + 1
+				p += b[p] >= 192 ? 2 : 1
+				if (p + 13 > NR || b[p] != 0 || b[p+1] != 1 || b[p+2] != 0 ||
+				    b[p+3] != 1 || b[p+8] != 0 || b[p+9] != 4) exit 1
+				exit (sprintf("%d.%d.%d.%d", b[p+10], b[p+11], b[p+12], b[p+13]) != ip)
+			}'
+}
+
+local_dns_ready() {
+	local address6=${local_dns6%\]:*}
+	dns_ready && dns_tcp_probe "$lan_ip" &&
+		{ [ -z "$local_dns6" ] || dns_tcp_probe "${address6#\[}"; }
 }
 
 public_dns_answer() {
@@ -91,22 +171,84 @@ forwarding_ready() {
 	return 1
 }
 
-reload_upstream() {
-	local next=$1 pid switched=1
-	lock "$SERVICE_LOCK" || return 1
-	pid=$(cat "$RUNDIR/dnsmasq.pid" 2>/dev/null)
-	if current_instance && [ -n "$pid" ] && write_upstream "$next"; then
-		if kill -HUP "$pid" 2>/dev/null; then
-			active_upstream=$next
-			active_upstream_state=normal
-			[ "$next" = "$preferred_upstream" ] || active_upstream_state=fallback
-			switched=0
-		else
-			write_upstream "$active_upstream"
-		fi
+forwarding_through_plugin() {
+	public_dns_answer "$1" "$local_dns" &&
+		{ [ -z "$local_dns6" ] || public_dns_answer "$1" "$local_dns6"; }
+}
+
+reload_profile() {
+	local port=$1 target=$2 pid
+	current_instance || return 1
+	pid=$(cat "$RUNDIR/dnsmasq.$port.pid" 2>/dev/null) || return 1
+	write_upstream "$target" "$RUNDIR/upstream.$port" && kill -HUP "$pid" 2>/dev/null
+}
+
+check_dns_profile() {
+	local port=$1 policy=$2 preferred=$3 target server="127.0.0.1:$1" server6='' address6
+	dns_probe "$lan_ip:$port" && dns_tcp_probe "$lan_ip" "$port" || return 1
+	if [ "$policy" = dns ]; then
+		server6=${local_dns6%:*}:$port
+		address6=${server6%\]:*}
+		dns_probe "$server6" && dns_tcp_probe "${address6#\[}" "$port" || return 1
 	fi
-	lock -u "$SERVICE_LOCK"
-	[ "$switched" -eq 0 ]
+	case "$preferred" in
+		inherit|system)
+			forwarding_ready "$server" || return 1
+			;;
+		*)
+			target=$preferred
+			if ! forwarding_ready "$target"; then
+				target=$lan_ip
+				if ! forwarding_ready "$target"; then
+					target=$active_upstream
+					[ "$target" != "$lan_ip" ] && forwarding_ready "$target" || return 1
+				fi
+			fi
+			if [ "$(cat "$RUNDIR/upstream.$port" 2>/dev/null)" != "server=$target" ]; then
+				with_service_lock reload_profile "$port" "$target" || return 1
+				sleep 1
+			fi
+			public_dns_answer "$forwarding_host" "$server" || return 1
+			;;
+	esac
+	[ -z "$server6" ] || public_dns_answer "$forwarding_host" "$server6"
+}
+
+check_dns_profiles() {
+	local port _address _mac policy preferred workers='' worker failed=0
+	[ -s "$DNS_PROFILES" ] || return 0
+	while read -r port _address _mac policy preferred; do
+		check_dns_profile "$port" "$policy" "$preferred" 9>&- &
+		workers="$workers $!"
+	done < "$DNS_PROFILES"
+	for worker in $workers; do
+		wait "$worker" || failed=1
+	done
+	[ "$failed" = 0 ]
+}
+
+reload_upstream_locked() {
+	local pid port _address _mac _policy preferred
+	pid=$(cat "$RUNDIR/dnsmasq.pid" 2>/dev/null)
+	current_instance && [ -n "$pid" ] && write_upstream "$1" || return 1
+	if ! kill -HUP "$pid" 2>/dev/null; then
+		write_upstream "$active_upstream"
+		return 1
+	fi
+	if [ -s "$DNS_PROFILES" ]; then
+		while read -r port _address _mac _policy preferred; do
+			[ "$preferred" = inherit ] || continue
+			pid=$(cat "$RUNDIR/dnsmasq.$port.pid" 2>/dev/null) && kill -HUP "$pid" 2>/dev/null || return 1
+		done < "$DNS_PROFILES"
+	fi
+}
+
+reload_upstream() {
+	local next=$1
+	with_service_lock reload_upstream_locked "$next" || return 1
+	active_upstream=$next
+	active_upstream_state=normal
+	[ "$next" = "$preferred_upstream" ] || active_upstream_state=fallback
 }
 
 switch_upstream() {
@@ -114,7 +256,7 @@ switch_upstream() {
 	reload_upstream "$1" || return 1
 	# dnsmasq reloads servers-file asynchronously after SIGHUP.
 	sleep 1
-	public_dns_answer "$host" "$local_dns" && return 0
+	forwarding_through_plugin "$host" && return 0
 	if ! reload_upstream "$previous"; then
 		failure='Could not set DNS upstream'
 		exit 1
@@ -129,26 +271,85 @@ switch_to_alternate() {
 	forwarding_ready "$next" && switch_upstream "$next"
 }
 
+write_upstream_state() {
+	local state=$1 previous
+	previous=$(cat "$UPSTREAM_STATE" 2>/dev/null)
+	[ "$state" != "$previous" ] || return 0
+	printf '%s\n' "$state" > "$UPSTREAM_STATE" || return 1
+	case "$state" in
+		fallback) logger -t xboxdownload_openwrt 'Custom upstream unavailable; ordinary DNS forwarded to system DNS' ;;
+		unavailable) logger -t xboxdownload_openwrt 'No working upstream for ordinary DNS; interception paused' ;;
+		dns_unavailable) logger -t xboxdownload_openwrt 'Local DNS health check failed; interception paused' ;;
+		normal) [ -z "$previous" ] || logger -t xboxdownload_openwrt 'DNS health checks passed; interception active' ;;
+	esac
+	return 0
+}
+
 publish_upstream_state() {
-	local state=$1
-	[ "$state" != "$last_upstream_state" ] || return 0
-	lock "$SERVICE_LOCK" || return 1
-	if current_instance; then
-		printf '%s\n' "$state" > "$UPSTREAM_STATE"
-		last_upstream_state=$state
-		case "$state" in
-			fallback) logger -t xboxdownload_openwrt 'Custom upstream unavailable; ordinary DNS forwarded to system DNS' ;;
-			unavailable) logger -t xboxdownload_openwrt 'No working upstream for ordinary DNS; local download rules remain active' ;;
-			normal) logger -t xboxdownload_openwrt 'Upstream DNS has recovered' ;;
-		esac
+	current_instance && write_upstream_state "$1"
+}
+
+apply_active_rules() {
+	{
+		cat "$RUNDIR/rules.nft" || return 1
+		if [ "$mode" = redirect ] && [ -s "$HTTPS_ORIGINS" ]; then
+			write_https_elements "$HTTPS_ORIGINS"
+		fi
+	} | nft -f -
+}
+
+replace_https_origins() {
+	current_instance || return 1
+	if [ "$intercepting" = 1 ]; then
+		{
+			printf '%s\n' 'flush map ip xboxdownload_openwrt https_origins'
+			write_https_elements "$1"
+		} | nft -f - || return 1
 	fi
-	lock -u "$SERVICE_LOCK"
+	mv -f "$1" "$HTTPS_ORIGINS"
+}
+
+refresh_https_origins() {
+	local now fresh
+	[ "$mode" = redirect ] && [ -s "$HTTPS_ORIGINS" ] || return 0
+	now=$(date +%s)
+	[ "$now" -ge "$origin_refresh_at" ] || return 0
+	origin_refresh_at=$((now + 120))
+	fresh=$(mktemp "$RUNDIR/https-refresh.XXXXXX") || return 0
+	if resolve_https_origins "$HTTPS_ORIGINS" "$lan_ip" "$active_upstream" > "$fresh" &&
+		[ -s "$fresh" ] && ! cmp -s "$fresh" "$HTTPS_ORIGINS"; then
+		with_service_lock replace_https_origins "$fresh"
+	fi
+	rm -f "$fresh"
+}
+
+# Replace both tables in one transaction. Keep the listener access restrictions while bypassed.
+set_interception() {
+	current_instance || return 1
+	if [ "$1" = bypass ]; then
+		nft -f "$RUNDIR/bypass.nft" && rm -f "$RUNDIR/ready" && write_upstream_state "$2"
+	else
+		apply_active_rules && write_upstream_state "$2" &&
+			rm -f "$RUNDIR/error" && printf '%s\n' "$token" > "$RUNDIR/ready"
+	fi
+}
+
+pause_interception() {
+	if [ "$intercepting" = 1 ]; then
+		if ! with_service_lock set_interception bypass "$1"; then
+			failure=$RULE_CLEANUP_ERROR
+			return 1
+		fi
+		intercepting=0
+	else
+		with_service_lock publish_upstream_state "$1"
+	fi
 }
 
 monitor_services() {
-	local failures=0 http_failures=0 recoveries=0 retry_delay=0
+	local failures=0 dns_failures=0 http_failures=0 recoveries=0 retry_delay=0 healthy=0
 	while current_instance; do
-		sleep 30 &
+		sleep 30 9>&- &
 		timer_pid=$!
 		wait "$timer_pid"
 		timer_pid=
@@ -162,8 +363,20 @@ monitor_services() {
 				return 1
 			fi
 		fi
+		if ! local_dns_ready; then
+			healthy=0
+			failures=0
+			recoveries=0
+			dns_failures=$((dns_failures + 1))
+			[ "$dns_failures" -lt 2 ] || pause_interception dns_unavailable || return 1
+			continue
+		fi
+		dns_failures=0
+
 		# Also query the active resolver so the plugin's cache cannot conceal its loss.
-		if forwarding_ready "$active_upstream" && public_dns_answer "$forwarding_host" "$local_dns"; then
+		if [ "$use_default_upstream" = 0 ]; then
+			:
+		elif forwarding_ready "$active_upstream" && forwarding_through_plugin "$forwarding_host"; then
 			failures=0
 			if [ "$active_upstream_state" = fallback ]; then
 				if [ "$retry_delay" -gt 0 ]; then
@@ -178,26 +391,49 @@ monitor_services() {
 					recoveries=0
 				fi
 			fi
-			publish_upstream_state "$active_upstream_state"
-			continue
-		fi
-		recoveries=0
-		failures=$((failures + 1))
-		[ "$failures" -ge 2 ] || continue
-		if switch_to_alternate; then
+		else
+			recoveries=0
+			failures=$((failures + 1))
+			if [ "$intercepting" = 1 ] && [ "$failures" -lt 2 ]; then
+				continue
+			fi
+			if ! switch_to_alternate; then
+				healthy=0
+				pause_interception unavailable || return 1
+				continue
+			fi
 			failures=0
 			retry_delay=0
-			publish_upstream_state "$active_upstream_state"
+		fi
+
+		if ! check_dns_profiles; then
+			healthy=0
+			pause_interception dns_unavailable || return 1
+			continue
+		fi
+
+		if [ "$intercepting" = 1 ]; then
+			with_service_lock publish_upstream_state "$active_upstream_state"
+			refresh_https_origins
+		elif [ "$http_failures" = 0 ]; then
+			healthy=$((healthy + 1))
+			[ "$healthy" -ge 2 ] || continue
+			if ! with_service_lock set_interception active "$active_upstream_state"; then
+				failure='Could not activate nftables rules'
+				return 1
+			fi
+			intercepting=1
+			healthy=0
 		else
-			publish_upstream_state unavailable
+			healthy=0
 		fi
 	done
 }
 
-read_http_response() {
+read_tcp_response() {
 	local connection deadline
 	# The OpenWrt BusyBox nc applet has no timeout option.
-	/bin/busybox nc "$lan_ip" "$HTTP_PORT" <&3 2>/dev/null &
+	/bin/busybox nc "$1" "$2" <&3 2>/dev/null &
 	connection=$!
 	(sleep 1; kill "$connection") >/dev/null 2>&1 &
 	deadline=$!
@@ -209,12 +445,12 @@ read_http_response() {
 http_ready() {
 	local path='/__xboxdownload_openwrt_health?probe=302&path=%2F'
 	[ "$mode" = dns ] && return 0
-	kill -0 "$http_pid" 2>/dev/null || return 1
+	[ -e "$lease.started" ] || return 1
 	{
 		printf 'GET %s HTTP/1.1\r\nHost: assets1.xboxlive.com\r\nConnection: close\r\n\r\n' "$path"
 		# Keep stdin open while the minimal nc applet receives the response.
 		sleep 1
-	} | read_http_response 3<&0 |
+	} | read_tcp_response "$lan_ip" "$HTTP_PORT" 3<&0 |
 		awk -v expected="http://assets1.xboxlive.cn$path" '
 			{ sub(/\r$/, "") }
 			NR == 1 { status = ($1 ~ /^HTTP\/1\.[01]$/ && $2 == 302) }
@@ -226,36 +462,33 @@ http_ready() {
 			END { exit !(status && complete && location == expected) }'
 }
 
-lock "$SERVICE_LOCK" || exit 1
-if ! current_instance; then
-	lock -u "$SERVICE_LOCK"
-	exit 0
-fi
-# Also remove rules left by a killed supervisor before attempting its restart.
-rm -f "$RUNDIR/ready" "$UPSTREAM_STATE"
-if ! clear_rules; then
-	printf '%s\n' "$RULE_CLEANUP_ERROR" > "$RUNDIR/error"
-	lock -u "$SERVICE_LOCK"
-	exit 1
-fi
-if [ -n "$configured_upstream" ] && ! write_upstream "$configured_upstream"; then
-	printf '%s\n' 'Could not set DNS upstream' > "$RUNDIR/error"
-	lock -u "$SERVICE_LOCK"
-	exit 1
-fi
-lock -u "$SERVICE_LOCK"
+prepare_supervisor() {
+	current_token || return 1
+	rm -f "$RUNDIR/ready" "$UPSTREAM_STATE"
+	if ! clear_rules; then
+		printf '%s\n' "$RULE_CLEANUP_ERROR" > "$RUNDIR/error"
+		return 1
+	fi
+	if [ -n "$configured_upstream" ] && ! write_upstream "$configured_upstream"; then
+		printf '%s\n' 'Could not set DNS upstream' > "$RUNDIR/error"
+		return 1
+	fi
+	printf '%s\n' "$lease" > "$RUNDIR/owner"
+}
 
+lease=$(mktemp "$RUNDIR/supervisor.XXXXXX") || exit 1
 trap cleanup EXIT
 trap 'listener_error="Could not start or verify DNS on port $DNS_PORT"' USR1
 trap 'listener_error="Could not start or verify HTTP on port $HTTP_PORT"' USR2
 trap 'exit 0' TERM INT
-watch USR1 /usr/sbin/dnsmasq -k -C "$RUNDIR/dnsmasq.conf" &
-dns_pid=$!
-if [ "$mode" = redirect ]; then
-	watch USR2 /usr/sbin/uhttpd -f -p "$lan_ip:$HTTP_PORT" \
-		-h "$DATA/http" -D -x /cgi-bin -E /cgi-bin/redirect -T 5 -t 5 -n 4 -N 32 &
-	http_pid=$!
-fi
+exec 9>"$lease"
+flock -x 9 && with_service_lock prepare_supervisor || exit 1
+(
+	trap - EXIT
+	exec 9>&-
+	guard_listeners
+) &
+guard_pid=$!
 
 for attempt in 1 2 3; do
 	[ -z "$listener_error" ] || exit 1
@@ -269,32 +502,19 @@ for attempt in 1 2 3; do
 done
 
 failure='Could not forward ordinary DNS queries'
-if ! forwarding_ready "$local_dns"; then
+if [ "$use_default_upstream" = 1 ] &&
+	{ ! forwarding_ready "$local_dns" || ! forwarding_through_plugin "$forwarding_host"; }; then
 	switch_to_alternate || exit 1
 fi
+check_dns_profiles || exit 1
 
-# Hold the lifecycle lock so a concurrent stop cannot leave new rules behind.
-failed=0
-trap 'failed=1' TERM INT
-lock "$SERVICE_LOCK" || exit 1
-if [ "$failed" = 0 ] && [ -z "$listener_error" ] && current_instance; then
-	failure='Could not activate nftables rules'
-	if nft -f "$RUNDIR/rules.nft"; then
-		printf '%s\n' "$token" > "$RUNDIR/ready"
-		rm -f "$RUNDIR/error"
-		failure='A download service stopped; system DNS restored'
-	else
-		failed=1
-	fi
-else
-	failed=1
-fi
-lock -u "$SERVICE_LOCK"
-trap 'exit 0' TERM INT
 trap 'exit 1' USR1 USR2
-[ "$failed" = 0 ] && [ -z "$listener_error" ] || exit 1
-last_upstream_state=normal
-publish_upstream_state "$active_upstream_state"
+[ -z "$listener_error" ] || exit 1
+failure='Could not activate nftables rules'
+with_service_lock set_interception active "$active_upstream_state" || exit 1
+failure='A download service stopped; system DNS restored'
+intercepting=1
+origin_refresh_at=$(($(date +%s) + 120))
 # The listener watchers still interrupt the supervisor immediately on exit.
 monitor_services
 exit 1

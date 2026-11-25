@@ -18,8 +18,10 @@ function ipNumber(address) {
 function lanDevices(hints, lan) {
 	const interfaces = Array.isArray(lan['ipv4-address']) ? lan['ipv4-address'] : [];
 	const routerIPs = new Set(interfaces.map(item => item.address));
-	const subnets = interfaces.map(item => ({ base: ipNumber(item.address), bits: Number(item.mask) }))
-		.filter(item => item.base != null && Number.isInteger(item.bits) && item.bits > 0 && item.bits <= 32)
+	const subnets = interfaces.map(item => ({
+		base: ipNumber(item.address), bits: item.mask == null || item.mask === '' ? NaN : Number(item.mask)
+	}))
+		.filter(item => item.base != null && Number.isInteger(item.bits) && item.bits >= 0 && item.bits <= 32)
 		.map(item => {
 			const size = 2 ** (32 - item.bits);
 			return { first: Math.floor(item.base / size) * size, size: size };
@@ -34,8 +36,10 @@ function lanDevices(hints, lan) {
 			return;
 		for (const ip of ips) {
 			const number = ipNumber(ip);
-			if (number == null || routerIPs.has(ip) || devices.has(ip) ||
-			    !subnets.some(net => number >= net.first && number < net.first + net.size))
+			if (number == null || number >= 224 * 2 ** 24 || /^(0|127|169\.254)\./.test(ip) ||
+			    routerIPs.has(ip) || devices.has(ip) ||
+			    !subnets.some(({ first, size }) => number >= first && number < first + size &&
+			        (size <= 2 || (number !== first && number !== first + size - 1))))
 				continue;
 			const name = typeof hint.name === 'string' ? hint.name.trim() : '';
 			devices.set(ip, {
@@ -77,10 +81,16 @@ function profiles(value) {
 	return entries;
 }
 
-function selectedDevices(settings) {
+function selectedDevices(settings, routeKeys) {
 	const saved = profiles(settings.ipv6_devices);
-	return new Map((settings.client || '').split(/[\s,，]+/).filter(Boolean)
+	const entries = new Map((settings.client || '').split(/[\s,，]+/).filter(Boolean)
 		.map(ip => [ip, saved.get(ip) || { mode: 'system', mac: '' }]));
+	for (const row of (settings.device_routes || '').split(',')) {
+		const [ip, ...values] = row.split('/');
+		if (entries.has(ip) && values.length === routeKeys.length)
+			entries.get(ip).route = Object.fromEntries(routeKeys.map((key, index) => [key, values[index]]));
+	}
+	return entries;
 }
 
 function button(label, style, description) {
@@ -90,8 +100,9 @@ function button(label, style, description) {
 }
 
 return baseclass.extend({
-	render: async function(initial, deviceNameHelp) {
-		let entries = selectedDevices(initial);
+	render: async function(initial, validateAddresses, nodeLabels, deviceNameHelp) {
+		const routeKeys = ['filter_aaaa', 'upstream', ...Object.keys(nodeLabels)];
+		let entries = selectedDevices(initial, routeKeys);
 		const table = new ui.Table(['设备', 'IPv4', 'MAC 地址', 'IPv6 策略', '操作'], { sortable: false });
 		const tableNode = table.render();
 		tableNode.setAttribute('aria-label', '加速设备');
@@ -128,7 +139,8 @@ return baseclass.extend({
 				const conflict = profile.mac && device?.mac && device.mac !== profile.mac;
 				const address = moved ? E('span', {}, [ip, E('small', { class: 'xb-node' }, ['发现新地址 ' + moved + '，请编辑设备'])]) :
 					conflict ? E('span', {}, [ip, E('small', { class: 'xb-node' }, ['MAC 不匹配，已跳过 IPv4 接管'])]) : ip;
-				return [device?.name || '未命名设备', address, profile.mac || device?.mac || '—', modes[profile.mode],
+				const policy = profile.route ? E('div', {}, [modes[profile.mode], E('small', { class: 'xb-node' }, ['自定义线路'])]) : modes[profile.mode];
+				return [device?.name || '未命名设备', address, profile.mac || device?.mac || '—', policy,
 					E('div', { class: 'xb-row' }, [edit, remove])];
 			});
 			table.update(rows, '尚未添加设备。').querySelectorAll('th[data-sortable-row]')
@@ -158,7 +170,8 @@ return baseclass.extend({
 			const profile = entries.get(originalIP) || { mode: 'dns', mac: '' };
 			const known = discovered.get(originalIP);
 			const map = new form.JSONMap({ device: {
-				ipv4: originalIP || '', ipv6: '未发现', mode: profile.mode, mac: profile.mac || known?.mac || ''
+				ipv4: originalIP || '', ipv6: '未发现', mode: profile.mode, mac: profile.mac || known?.mac || '',
+				routing: profile.route ? 'custom' : 'shared', filter_aaaa: '0', ...profile.route
 			} });
 			const section = map.section(form.NamedSection, 'device', 'device');
 			const pickerOption = section.option(form.ListValue, 'host', '局域网设备');
@@ -171,6 +184,20 @@ return baseclass.extend({
 			for (const [value, label] of Object.entries(modes)) modeOption.value(value, label);
 			const macOption = section.option(form.Value, 'mac', 'MAC 地址');
 			macOption.placeholder = 'AA:BB:CC:DD:EE:FF';
+			const routingOption = section.option(form.ListValue, 'routing', '下载线路');
+			routingOption.value('shared', '使用服务页设置');
+			routingOption.value('custom', '自定义');
+			const filterOption = section.option(form.ListValue, 'filter_aaaa', '过滤 AAAA 应答');
+			filterOption.value('0', '关闭');
+			filterOption.value('1', '开启');
+			filterOption.depends({ routing: 'custom', mode: 'system' });
+			filterOption.depends({ routing: 'custom', mode: 'block' });
+			const routeOptions = Object.entries({ upstream: '上游 DNS', ...nodeLabels }).map(([key, label]) => {
+				const value = section.option(form.Value, key, label);
+				value.placeholder = key === 'upstream' ? '使用路由器现有 DNS' : '自动解析';
+				value.depends('routing', 'custom');
+				return [key, value];
+			});
 
 			const body = await map.render();
 			body.classList.add('xb-device-editor');
@@ -180,6 +207,14 @@ return baseclass.extend({
 			const address6 = control(address6Option, 'input');
 			const mode = control(modeOption, 'select');
 			const mac = control(macOption, 'input');
+			const routing = control(routingOption, 'select');
+			const filter = control(filterOption, 'select');
+			const routeInputs = routeOptions.map(([key, option]) => [key, control(option, 'input')]);
+			function routeSettings() {
+				if (routing.value !== 'custom') return null;
+				return { filter_aaaa: mode.value === 'dns' ? '0' : filter.value,
+					...Object.fromEntries(routeInputs.map(([key, input]) => [key, input.value.trim()])) };
+			}
 			address.autocomplete = 'off';
 			address6.readOnly = true;
 			mac.autocomplete = 'off';
@@ -262,11 +297,20 @@ return baseclass.extend({
 			mac.addEventListener('input', function() { error.textContent = ''; updateNote(); });
 			refresh.addEventListener('click', loadChoices);
 			cancel.addEventListener('click', () => ui.hideModal());
-			confirm.addEventListener('click', function() {
+			confirm.addEventListener('click', async function() {
 				const ip = address.value.trim();
-				const number = ipNumber(ip);
 				const value = mac.value.trim().replace(/-/g, ':').toUpperCase();
-				if (number == null || number >= 224 * 2 ** 24 || /^(0|127|169\.254)\./.test(ip) || ip === state.router) {
+				const policy = mode.value;
+				const route = routeSettings();
+				if (route && [route.main_ip, route.legacy_ip].some(value => value.includes(':'))) {
+					error.textContent = 'Xbox cn1、cn2 线路请填写公网 IPv4 节点。';
+					return;
+				}
+				if (route && Object.values(route).some(value => !/^[0-9a-f:.]*$/i.test(value))) {
+					error.textContent = '请检查自定义线路里的 DNS 和 CDN IP 地址。';
+					return;
+				}
+				if (ipNumber(ip) == null) {
 					error.textContent = '请输入有效的设备 IPv4 地址，且与路由器地址不同。';
 					address.focus();
 					return;
@@ -276,7 +320,7 @@ return baseclass.extend({
 					address.focus();
 					return;
 				}
-				if ((value || mode.value !== 'system') && (!/^[0-9A-F][02468ACE](?::[0-9A-F]{2}){5}$/.test(value) ||
+				if ((value || policy !== 'system') && (!/^[0-9A-F][02468ACE](?::[0-9A-F]{2}){5}$/.test(value) ||
 				    value === '00:00:00:00:00:00')) {
 					error.textContent = '当前 IPv6 策略需要有效的设备 MAC 地址。';
 					mac.focus();
@@ -288,8 +332,32 @@ return baseclass.extend({
 					mac.focus();
 					return;
 				}
+				if (ip !== originalIP) {
+					confirm.disabled = true;
+					let validation;
+					try {
+						validation = await validateAddresses('client', ip);
+					} catch (failure) {
+						validation = {};
+					} finally {
+						confirm.disabled = false;
+					}
+					if (!body.isConnected || !document.body.classList.contains('modal-overlay-active') ||
+					    ip !== address.value.trim() || policy !== mode.value ||
+					    JSON.stringify(route) !== JSON.stringify(routeSettings()) ||
+					    value !== mac.value.trim().replace(/-/g, ':').toUpperCase())
+						return;
+					if (validation?.error !== '') {
+						error.textContent = validation?.error === 'client_subnet' ?
+							'请输入路由器 LAN 子网内可用的设备 IPv4 地址。' :
+							validation?.error === 'client' ? '请输入有效的设备 IPv4 地址。' :
+							'无法校验 LAN IPv4 子网，请检查 LAN 状态后重试。';
+						address.focus();
+						return;
+					}
+				}
 				if (editing && originalIP !== ip) entries.delete(originalIP);
-				entries.set(ip, { mode: mode.value, mac: value });
+				entries.set(ip, { mode: policy, mac: value, route });
 				ui.hideModal();
 				draw();
 			});
@@ -319,12 +387,14 @@ return baseclass.extend({
 				return {
 					client: Array.from(entries.keys()).join(','),
 					ipv6_devices: Array.from(entries, ([ip, { mode, mac }]) =>
-						[ip, mac, mode].join('/')).join(',')
+						[ip, mac, mode].join('/')).join(','),
+					device_routes: Array.from(entries).filter(([, profile]) => profile.route)
+						.map(([ip, { route }]) => [ip, ...routeKeys.map(key => route[key])].join('/')).join(',')
 				};
 			},
 			update: function(data) { state = data; },
 			restoreDraft: function(settings) {
-				entries = selectedDevices(settings);
+				entries = selectedDevices(settings, routeKeys);
 				draw();
 			},
 			loadOnce: function() { if (!started) refreshDevices(); }

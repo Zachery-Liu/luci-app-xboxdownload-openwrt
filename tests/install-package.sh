@@ -41,10 +41,48 @@ cp package/post-deinstall "$root/tmp/post-deinstall"
 mv "$root/etc/init.d/xboxdownload_openwrt" "$root/tmp/real-init"
 cat > "$root/etc/init.d/xboxdownload_openwrt" <<'EOF'
 #!/bin/sh
-[ "$1" != disable ] || touch /tmp/disabled
+. /usr/share/xboxdownload_openwrt/common.sh
+case "$1" in
+	restart)
+		[ -e /tmp/leave-stale ] && exit 0
+		[ ! -e /tmp/restart-fails ] || exit 1
+		printf 'new-%s\n' "$$" > "$RUNDIR/instance"
+		nft -f - <<'NFT'
+destroy table ip xboxdownload_openwrt
+table ip xboxdownload_openwrt {
+	chain select_xbox { }
+}
+NFT
+		(sleep 1; cp "$RUNDIR/instance" "$RUNDIR/ready") </dev/null >/dev/null 2>&1 &
+		;;
+	disable) touch /tmp/disabled ;;
+esac
 exit 0
 EOF
 chmod +x "$root/etc/init.d/xboxdownload_openwrt"
+run="$root/tmp/run/xboxdownload_openwrt"
+mkdir -p "$run"
+printf 'previous\n' > "$run/instance"
+cp "$run/instance" "$run/ready"
+chroot "$root" uci set xboxdownload_openwrt.main.enabled=1
+chroot "$root" uci commit xboxdownload_openwrt
+touch "$root/tmp/leave-stale"
+if chroot "$root" sh /tmp/post-install; then
+	echo 'Upgrade accepted the old ready instance' >&2
+	exit 1
+fi
+rm "$root/tmp/leave-stale"
+touch "$root/tmp/restart-fails"
+if chroot "$root" sh /tmp/post-install; then
+	echo 'Upgrade hid a failed restart' >&2
+	exit 1
+fi
+rm "$root/tmp/restart-fails"
+chroot "$root" sh /tmp/post-install
+case "$(cat "$run/ready")" in new-*) ;; *) exit 1 ;; esac
+cmp -s "$run/instance" "$run/ready"
+echo 'PASS: an enabled upgrade waits for new interception and reports a failed or stale restart'
+
 nft add table ip xboxdownload_openwrt
 nft add table inet xboxdownload_openwrt_ipv6
 if chroot "$root" sh /tmp/pre-deinstall; then

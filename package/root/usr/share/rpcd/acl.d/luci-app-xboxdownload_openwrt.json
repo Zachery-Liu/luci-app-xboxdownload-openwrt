@@ -6,6 +6,6 @@
 			"luci-rpc": ["getHostHints"],
 			"network.interface.lan": ["status"]
 		} },
-		"write": { "ubus": { "xboxdownload_openwrt": ["configure", "probe", "import_nodes", "clear_logs"] } }
+		"write": { "ubus": { "xboxdownload_openwrt": ["configure", "configure_status", "validate_addresses", "probe", "import_nodes", "clear_logs"] } }
 	}
 }

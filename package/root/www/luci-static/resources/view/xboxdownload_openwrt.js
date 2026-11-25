@@ -11,25 +11,43 @@
 const getStatus = rpc.declare({ object: 'xboxdownload_openwrt', method: 'status', reject: true });
 const configure = rpc.declare({
 	object: 'xboxdownload_openwrt', method: 'configure',
-	params: ['client', 'main_ip', 'legacy_ip', 'enabled', 'extra'], reject: true
+	params: ['client', 'main_ip', 'legacy_ip', 'enabled', 'extra', 'background'], reject: true
+});
+const configureStatus = rpc.declare({
+	object: 'xboxdownload_openwrt', method: 'configure_status', params: ['job'], reject: true
+});
+const validateAddresses = rpc.declare({
+	object: 'xboxdownload_openwrt', method: 'validate_addresses', params: ['kind', 'addresses'], reject: true
 });
 const clearLogs = rpc.declare({ object: 'xboxdownload_openwrt', method: 'clear_logs', expect: { '': {} } });
 const extraKeys = ['upstream', 'probe_domain', 'global_ip', 'app_ip', 'ps_ip', 'ns_ip', 'ea_ip', 'battle_ip',
-	'mode', 'filter_aaaa', 'log_mode', 'log_path', 'ipv6_devices'];
+	'mode', 'filter_aaaa', 'log_mode', 'log_path', 'ipv6_devices', 'device_routes'];
 const pendingKey = 'xboxdownload-openwrt.pending-settings';
 const viewPath = 'admin/services/xboxdownload_openwrt';
 const settingDefaults = { mode: 'redirect', filter_aaaa: '0', log_mode: 'http', log_path: '0' };
+const dnsPauseNotices = {
+	unavailable: '上游 DNS 探测失败，已撤下加速接管。设备使用系统 DNS，探测恢复后自动继续。',
+	dns_unavailable: '本地 DNS 服务探测失败，已撤下加速接管。设备使用系统 DNS，探测恢复后自动继续。'
+};
+
+function dnsPaused(state) {
+	return state.enabled && !state.running && Object.hasOwn(dnsPauseNotices, state.upstream_state);
+}
 const errors = {
 	client: '请输入 1–8 个局域网设备 IPv4 地址，并确保它们和路由器地址不同。',
+	client_subnet: '设备 IPv4 必须是路由器 LAN 子网内可用的主机地址。',
+	lan_subnet: '无法读取路由器的 LAN IPv4 子网，请检查 LAN 状态。',
 	cdn: 'CDN 节点必须是公网 IPv4 或 IPv6 地址。',
+	cdn_family: 'Xbox cn1、cn2 线路请填写公网 IPv4 节点。',
 	upstream: '上游 DNS 必须是有效 IP 地址。',
 	probe_domain: '请输入有效的探测域名，例如 dns.example.com。',
 	ipv6: '已配置 IPv6 CDN 节点，请先关闭 AAAA 过滤。',
 	ipv6_device: '请检查加速设备的 IPv4 与 IPv6 策略。接管 DNS 或关闭公网 IPv6 时，需要填写设备的 MAC 地址。',
 	ipv6_mac_duplicate: '同一个 MAC 地址只能配置一次 IPv6 策略，请检查加速设备列表。',
 	ipv6_reload: '设备配置已升级，请刷新页面后再保存。',
-	ipv6_filter: '保留 IPv6 时，请先关闭「过滤已选设备的 AAAA 应答」。',
-	ipv6_cdn: '有设备关闭了公网 IPv6。请将所有已填的 IPv6 下载节点改用 IPv4 或留空。',
+	ipv6_filter: '保留 IPv6 的设备需要关闭其自定义线路的 AAAA 过滤。',
+	ipv6_cdn: '关闭公网 IPv6 的设备只能在自定义线路中填写 IPv4 节点。',
+	device_routes: '请检查设备的自定义线路，并确认设备仍在已选列表中。',
 	lan: '路由器的 lan 接口没有可用的 IPv4 地址。',
 	lan_ipv6: 'LAN 暂无可用的 IPv6 链路本地地址，已恢复原设置。',
 	dns_upstream: '无法验证普通域名的 DNS 转发，已恢复原设置。',
@@ -38,11 +56,15 @@ const errors = {
 	stop: '无法确认服务已停止，已恢复原设置。',
 	rollback: '无法恢复旧设置或服务。已撤下接管规则，请查看系统日志。',
 	rollback_rules: '无法恢复旧设置或服务，也无法确认接管规则已撤下。请查看系统日志。',
+	job_lost: '无法确认配置操作结果。请刷新服务状态后再试。',
 	save: '保存设置失败。',
 	busy: '配置正在更新，请稍后再试。'
 };
 const serviceErrors = {
 	'LAN IPv4 unavailable': 'LAN 暂无 IPv4 地址。',
+	'Invalid settings: lan_subnet': errors.lan_subnet,
+	'Invalid settings: client_subnet': errors.client_subnet,
+	'Invalid settings: cdn': errors.cdn,
 	'LAN IPv6 unavailable': 'LAN 暂无可用的 IPv6 链路本地地址。',
 	'Could not start or verify DNS on port 15353': '无法验证 DNS 监听（15353），设备继续使用系统 DNS。',
 	'Could not set DNS upstream': '无法加载 DNS 上游配置，设备使用系统 DNS。',
@@ -53,6 +75,7 @@ const serviceErrors = {
 	'Could not restore previous settings or service': '无法恢复旧设置或服务，已撤下接管规则。',
 	'Could not restore previous settings or verify rule removal': '无法恢复旧设置或服务，也无法确认接管规则已撤下。',
 	'A download service stopped; system DNS restored': '加速监听已退出，设备已恢复使用系统 DNS。',
+	'Supervisor exited unexpectedly; system DNS restored': '监督进程异常退出，已撤下接管规则。',
 	'Could not activate nftables rules': '无法启用转发规则，设备继续使用系统 DNS。'
 };
 
@@ -60,12 +83,10 @@ function notify(message, style = 'error') {
 	ui.addNotification(null, E('p', {}, [message]), style);
 }
 
-function showReadonlyValues(container, label, values) {
+function showReadonlyValues(container, values) {
 	for (const [index, value] of values.entries()) {
-		const row = container.children[index] || container.appendChild(new ui.Textfield(value, { readonly: true }).render());
-		const input = row.querySelector('input');
-		input.setAttribute('aria-label', values.length > 1 ? label + ' ' + (index + 1) : label);
-		if (input.value !== value) input.value = value;
+		const row = container.children[index] || container.appendChild(E('div', { class: 'xb-overview-value' }));
+		if (row.textContent !== value) row.textContent = value;
 	}
 	while (container.children.length > values.length)
 		container.lastElementChild.remove();
@@ -107,7 +128,7 @@ function sameSetting(key, first, second) {
 function settingsPatch(settings, original) {
 	const patch = Object.fromEntries(Object.entries(settings).filter(([key, value]) =>
 		!sameSetting(key, value, original[key])));
-	if ('client' in patch || 'ipv6_devices' in patch) {
+	if ('client' in patch || 'ipv6_devices' in patch || 'device_routes' in patch) {
 		patch.client = settings.client;
 		patch.ipv6_devices = settings.ipv6_devices;
 	}
@@ -128,7 +149,7 @@ return view.extend({
 		return this.stageSettings();
 	},
 	handleReset: function() {
-		return this.restoreSettings();
+		return this.restoreSettings(true);
 	},
 	handleSaveApply: function() {
 		return this.submitSettings();
@@ -164,7 +185,7 @@ return view.extend({
 		option(downloads, form.Value, 'probe_domain', 'DNS 探测域名',
 			'可填写一个本网络允许解析且返回公网 IPv4 的域名。插件优先查询它，失败时再使用内置探针。').placeholder = '使用内置探针';
 		option(downloads, form.Flag, 'filter_aaaa', '过滤已选设备的 AAAA 应答',
-			'移除插件 DNS 应答中的 IPv6 地址，普通域名也受影响。使用「保留 IPv6，接管 DNS」时请保持关闭。');
+			'移除默认线路 DNS 应答中的 IPv6 地址。选择「保留 IPv6，接管 DNS」的设备仍会收到普通域名的 IPv6 地址。');
 		logSettings.tab('recent-logs', '最近日志');
 		logSettings.tab('log-settings', '日志设置');
 		const recentLogs = logSettings.taboption('recent-logs', form.DummyValue, '_recent_logs');
@@ -187,7 +208,7 @@ return view.extend({
 		widgets.mode.node.parentElement.classList.add('xb-row');
 		widgets.mode.node.after(goSpeed);
 
-		const devices = await devicePicker.render(initial, () =>
+		const devices = await devicePicker.render(initial, validateAddresses, nodeLabels, () =>
 			helpTooltip('如何查看 Xbox 设备名称',
 				'按手柄上的 Xbox 键，依次打开「档案和系统 → 设置 → 系统 → 主机信息 → 名称」。默认名称为 XBOX，改过名则以主机显示为准。'));
 		const status = E('strong', { class: 'xb-state', role: 'status' });
@@ -224,11 +245,12 @@ return view.extend({
 			const settings = fields();
 			const hasDevices = devices.selected().length > 0;
 			widgets.global_ip.setPlaceholder(settings.mode === 'dns' ? '留空使用系统 DNS' : '留空默认跳转到 CN 下载');
-			const retryUpstream = state.running && ['fallback', 'unavailable'].includes(state.upstream_state);
-			primary.hidden = state.running && !retryUpstream;
+			const retryUpstream = state.running && state.upstream_state === 'fallback';
+			const hasStartDevices = hasDevices || Boolean(state.client);
+			primary.hidden = (state.running && !retryUpstream) || dnsPaused(state);
 			primary.textContent = retryUpstream ? '重试上游 DNS' : state.enabled ? '重试启动' : '启动服务';
-			primary.disabled = updating || !state.router || !state.client;
-			primary.title = !state.client ? '请先添加设备并保存设置' : '';
+			primary.disabled = updating || !state.router || !hasStartDevices;
+			primary.title = hasStartDevices ? '' : '请先添加设备';
 			goDevices.hidden = hasDevices;
 			manageDevices.hidden = !hasDevices;
 			overviewPending.hidden = normalizeClients(settings.client) === normalizeClients(state.client || '');
@@ -241,24 +263,23 @@ return view.extend({
 			state = data;
 			devices.update(data);
 			const addresses = (data.lan_ipv6_dns || '').split(/\s+/).filter(Boolean);
-			showReadonlyValues(overviewIPv4, '路由器 IPv4 DNS', [data.router || '无可用地址']);
-			showReadonlyValues(overviewIPv6, '路由器 IPv6 DNS', addresses.length ? addresses : ['无可用地址']);
+			showReadonlyValues(overviewIPv4, [data.router || '无可用地址']);
+			showReadonlyValues(overviewIPv6, addresses.length ? addresses : ['无可用地址']);
 			const route = { present: '已发现 IPv6 默认路由。', absent: '未发现 IPv6 默认路由。' };
 			const announced = (data.lan_advertised_dns || '').split(/\s+/).filter(ip => ip.includes(':'));
 			ipv6Help.dataset.tooltip = ipv6HelpText + (route[data.wan6_state] || '') +
 				(announced.length ? '配置的 IPv6 通告 DNS 为 ' + announced.join('、') + '。' : '');
 			ipv6Help.setAttribute('aria-description', ipv6Help.dataset.tooltip);
-			const serviceLabel = data.running ? '服务运行中' : !data.enabled ? '服务已停止' :
+			const paused = dnsPaused(data);
+			const serviceLabel = data.running ? '服务运行中' : paused ? '加速已暂停' : !data.enabled ? '服务已停止' :
 				data.error ? '服务异常' : '服务正在启动';
 			if (status.textContent !== serviceLabel) status.textContent = serviceLabel;
 			status.dataset.state = data.running ? 'running' : data.enabled ? 'pending' : 'stopped';
-			const upstreamNotice = {
-				fallback: '自定义上游 DNS 无响应，普通域名已切回系统 DNS，下载加速继续运行。',
-				unavailable: '无法验证上游 DNS 转发。请检查 DNS 或更换探测域名。已配置的下载规则继续生效。'
-			};
 			const notice = data.error ? serviceErrors[data.error] || data.error :
 				!data.router ? '路由器的 LAN 接口没有可用的 IPv4 地址。' :
-				data.running ? upstreamNotice[data.upstream_state] || '' : '';
+				paused ? dnsPauseNotices[data.upstream_state] :
+				data.running && data.upstream_state === 'fallback' ?
+					'自定义上游 DNS 无响应，普通域名已切回系统 DNS，下载加速继续运行。' : '';
 			if (serviceError.textContent !== notice) serviceError.textContent = notice;
 			if (shown !== data.log) {
 				shown = data.log;
@@ -277,7 +298,7 @@ return view.extend({
 			overviewCount.hidden = !selected.length;
 			overviewEmpty.hidden = selected.length > 0;
 			overviewDevices.hidden = !selected.length;
-			showReadonlyValues(overviewDevices, '已选设备', selected.map(({ ip, device }) =>
+			showReadonlyValues(overviewDevices, selected.map(({ ip, device }) =>
 				device ? device.name + ' · ' + ip : ip));
 		}
 
@@ -286,10 +307,19 @@ return view.extend({
 				return false;
 			updating = true;
 			update(state);
+			speed.refresh();
 			try {
 				const extra = Object.fromEntries(extraKeys.filter(key => key in patch).map(key => [key, patch[key]]));
-				const response = await configure(patch.client, patch.main_ip, patch.legacy_ip, enabled,
-					JSON.stringify(extra));
+			let response = await configure(patch.client, patch.main_ip, patch.legacy_ip, enabled,
+				JSON.stringify(extra), 1);
+			const job = response?.job;
+			if (typeof job === 'string') {
+				const deadline = Date.now() + 120000;
+				do {
+					await new Promise(resolve => setTimeout(resolve, 500));
+					response = await configureStatus(job);
+				} while (response?.pending === true && Date.now() < deadline);
+			}
 				if (typeof response?.error !== 'string') throw new Error('Invalid configuration reply');
 				if (response.error !== '') {
 					notify(errors[response.error] || '参数无效或服务暂时不可用。');
@@ -309,6 +339,7 @@ return view.extend({
 			} finally {
 				updating = false;
 				update(state);
+				speed.refresh();
 			}
 		}
 
@@ -320,19 +351,37 @@ return view.extend({
 		}
 
 		primary.addEventListener('click', async function() {
-			if (await save(1)) speed.refresh();
+			if (updating || L.hasViewPermission() === false) return;
+			if (Object.keys(settingsPatch(fields(), formBase)).length || speed.settingsChanged()) {
+				notify('您还有未保存或未应用的内容。请先「保存并应用」或「复位」，再启动服务。', 'warning');
+				return;
+			}
+			if (speed.isTesting()) {
+				notify('请等待测速结束，或停止测速后再启动服务。', 'warning');
+				return;
+			}
+			await save(1);
 		});
 		stop.addEventListener('click', async function() {
-			if (await save(0)) speed.refresh();
+			if (updating || L.hasViewPermission() === false) return;
+			speed.stopTest();
+			await save(0);
 		});
 		function storePending(draft) {
 			pending = draft;
 			return session.setLocalData(pendingKey, draft);
 		}
+		function speedDraft() {
+			const draft = speed.draftSettings();
+			if (speed.validSettings(draft)) return draft;
+			notify('整批流量上限请输入非负数字，最多 9 位小数。填 0 表示不限。');
+			return null;
+		}
 		this.stageSettings = function() {
 			if (updating || L.hasViewPermission() === false) return;
 			const patch = settingsPatch(fields(), formBase);
-			const speedSettings = speed.draftSettings();
+			const speedSettings = speedDraft();
+			if (!speedSettings) return;
 			if (!Object.keys(patch).length && !speed.settingsChanged(speedSettings)) {
 				storePending(null);
 				return;
@@ -347,8 +396,9 @@ return view.extend({
 				widget.setValue(settings[key] ?? settingDefaults[key] ?? '');
 			devices.restoreDraft(settings);
 		}
-		this.restoreSettings = function() {
+		this.restoreSettings = function(discardDraft = false) {
 			if (updating || L.hasViewPermission() === false) return;
+			if (discardDraft) storePending(null);
 			if (pending?.settings && !pending.patch)
 				notify('旧版暂存草稿无法区分已修改的字段，已载入路由器当前设置，请重新核对。', 'warning');
 			restoreFields(pending?.patch);
@@ -357,11 +407,16 @@ return view.extend({
 		this.submitSettings = async function() {
 			if (updating || L.hasViewPermission() === false) return;
 			const settings = fields();
-			const speedSettings = speed.draftSettings();
+			const speedSettings = speedDraft();
+			if (!speedSettings) return;
 			const patch = settingsPatch(settings, formBase);
 			const changed = Object.keys(patch).length > 0;
 			if (!changed && !speed.settingsChanged(speedSettings)) {
 				storePending(null);
+				return;
+			}
+			if (speed.isTesting()) {
+				notify('测速正在进行。请等待测速结束，或停止测速后再应用设置。', 'warning');
 				return;
 			}
 			storePending({ patch, speedSettings });
@@ -371,7 +426,10 @@ return view.extend({
 				restoreFields(settingsPatch(fields(), settings));
 			}
 			const persisted = speed.applySettings(speedSettings);
-			storePending(null);
+			const remaining = settingsPatch(fields(), formBase);
+			const remainingSpeed = speed.draftSettings();
+			storePending(Object.keys(remaining).length || speed.settingsChanged(remainingSpeed) ?
+				{ patch: remaining, speedSettings: remainingSpeed } : null);
 			notify(persisted ? '已保存并应用。' : '测速设置仅在当前页面生效，浏览器无法保存。', 'info');
 			updateControls();
 		};
@@ -391,13 +449,13 @@ return view.extend({
 			}
 		});
 
-		const speed = await speedTest.render(function(group, ip) {
+		const speed = await speedTest.render(validateAddresses, function(group, ip) {
 			widgets[group + '_ip'].setValue(ip);
 			updateControls();
 		}, function(group) {
 			const key = group + '_ip';
 			return { saved: state[key] || '', draft: (widgets[key].getValue() || '').trim(), running: state.running };
-		});
+		}, () => updating);
 		const toolbar = E('section', { class: 'cbi-section xb-row xb-service-head', 'aria-label': '服务状态' }, [
 			E('div', {}, [status, serviceError]),
 			E('div', { class: 'xb-row' }, [goDevices, primary, stop])

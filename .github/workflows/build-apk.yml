@@ -76,7 +76,7 @@ jobs:
       - name: Install build dependencies
         run: |
           sudo apt-get update
-          sudo apt-get install --no-install-recommends -y dnsutils iproute2 iputils-ping nftables zstd
+          sudo apt-get install --no-install-recommends -y dnsutils iproute2 iputils-ping nftables openssl zstd
 
       - name: Build and verify the APK
         shell: bash
@@ -89,7 +89,11 @@ jobs:
 
           apk_tool="$RUNNER_TEMP/${IMAGEBUILDER_ARCHIVE%.tar.zst}/staging_dir/host/bin/apk"
           mkdir -p dist
-          sudo sh package/build.sh "$apk_tool"
+          if [[ "$GITHUB_REF_TYPE" == tag ]]; then
+            sudo sh package/build.sh "$apk_tool" "${GITHUB_REF_NAME#v}"
+          else
+            sudo sh package/build.sh "$apk_tool"
+          fi
 
           cd dist
           shopt -s nullglob
@@ -98,7 +102,12 @@ jobs:
           "$apk_tool" adbdump --allow-untrusted "${packages[0]}" | grep -Fx '  arch: noarch'
           if [[ "$GITHUB_REF_TYPE" == tag ]]; then
             version="${packages[0]#luci-app-xboxdownload-openwrt-}"
-            test "$GITHUB_REF_NAME" = "v${version%-r*.apk}"
+            version="${version%.apk}"
+            if [[ "$GITHUB_REF_NAME" == *-r* ]]; then
+              test "$GITHUB_REF_NAME" = "v$version"
+            else
+              test "$GITHUB_REF_NAME" = "v${version%-r*}"
+            fi
           fi
           sha256sum "${packages[0]}" > SHA256SUMS
 
@@ -147,9 +156,9 @@ jobs:
           curl --fail --silent --show-error --location --retry 3 --output "$rootfs" \
             https://downloads.openwrt.org/releases/25.12.6/targets/armsr/armv8/openwrt-25.12.6-armsr-armv8-generic-targz-rootfs.tar.gz
           printf '%s  %s\n' b781548d30886845176fee8256e115188029de0c42af252ffc6ea94a62794381 "$rootfs" | sha256sum --check
-          if ! command -v dig || ! command -v ip || ! command -v ping; then
+          if ! command -v dig || ! command -v ip || ! command -v ping || ! command -v openssl; then
             sudo apt-get update
-            sudo apt-get install --no-install-recommends -y dnsutils iproute2 iputils-ping
+            sudo apt-get install --no-install-recommends -y dnsutils iproute2 iputils-ping openssl
           fi
           sudo env OPENWRT_ROOTFS="$rootfs" sh tests/reliability.sh
           sudo env OPENWRT_ROOTFS="$rootfs" sh tests/ipv6-devices.sh
@@ -178,9 +187,23 @@ jobs:
           sha256sum --check SHA256SUMS
           tag_commit=$(gh api "repos/$GITHUB_REPOSITORY/commits/$RELEASE_TAG" --jq '.sha')
           test "$tag_commit" = "$GITHUB_SHA"
+          shopt -s nullglob
+          packages=(luci-app-xboxdownload-openwrt-*.apk)
+          test "${#packages[@]}" -eq 1
+          package=${packages[0]}
+          checksum="$package.sha256"
+          cp SHA256SUMS "$checksum"
           if gh release view "$RELEASE_TAG" --repo "$GITHUB_REPOSITORY" >/dev/null 2>&1; then
-            echo "::error::Release $RELEASE_TAG already exists. Create a new version tag; published assets are immutable."
-            exit 1
+            remote=$(mktemp -d)
+            trap 'rm -rf "$remote"' EXIT
+            for asset in "$package" "$checksum"; do
+              if ! gh release download "$RELEASE_TAG" --repo "$GITHUB_REPOSITORY" --pattern "$asset" --output "$remote/$asset" ||
+                 ! cmp -s -- "$asset" "$remote/$asset"; then
+                echo "::error::Published release $RELEASE_TAG differs from this build. Publish under a new version or revision tag."
+                exit 1
+              fi
+            done
+          else
+            gh release create "$RELEASE_TAG" "$package" "$checksum" \
+              --repo "$GITHUB_REPOSITORY" --verify-tag --generate-notes
           fi
-          gh release create "$RELEASE_TAG" ./*.apk SHA256SUMS \
-            --repo "$GITHUB_REPOSITORY" --verify-tag --generate-notes

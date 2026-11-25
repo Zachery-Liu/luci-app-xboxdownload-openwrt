@@ -10,7 +10,7 @@ const importNodes = rpc.declare({
 });
 const probe = rpc.declare({
 	object: 'xboxdownload_openwrt', method: 'probe',
-	params: ['group', 'ip', 'timeout', 'sample', 'family', 'file', 'ping_only'], expect: { '': {} }
+	params: ['group', 'ip', 'timeout', 'sample', 'family', 'file', 'ping_only', 'max_bytes'], expect: { '': {} }
 });
 
 const sources = {
@@ -52,6 +52,20 @@ const carriers = {
 };
 const pageSize = 24;
 const settingsKey = 'xboxdownload-openwrt.speed-settings';
+const bytesPerGB = 1000000000;
+const bytesPerMiB = 1048576;
+
+function batchBudgetBytes(value) {
+	const match = typeof value === 'string' && /^(\d*)(?:\.(\d{1,9}))?$/.exec(value);
+	if (!match || (!match[1] && !match[2]))
+		return null;
+	const bytes = Number(match[1]) * bytesPerGB + Number((match[2] || '').padEnd(9, '0'));
+	return Number.isSafeInteger(bytes) ? bytes : null;
+}
+
+function trafficText(bytes) {
+	return (bytes / bytesPerGB).toFixed(9).replace(/\.?0+$/, '') + ' GB';
+}
 
 function button(label, style) {
 	return E('button', { class: 'cbi-button' + (style ? ' ' + style : ''), type: 'button' }, [label]);
@@ -76,17 +90,10 @@ function addNode(nodes, ip, location) {
 	return true;
 }
 
-function ipv4(value) {
-	const parts = value.split('.');
-	return parts.length === 4 && parts.every(part => /^(?:0|[1-9]\d{0,2})$/.test(part) && Number(part) <= 255);
-}
-
-function nodeAddress(value) {
-	return ipv4(value) || /^[23][0-9a-f]{3}:[0-9a-f:]{2,34}$/i.test(value);
-}
-
 function formatResult(result) {
 	if (!result) return '待测速';
+	if (result.ok && result.capped) return '预算限量样本';
+	if (result.ok && result.shortSample) return '样本不足';
 	if (result.ok && result.exit === 28) return '超时前样本';
 	if (result.ok) return '可用';
 	if (result.error === 'cdn') return '需要公网 IP';
@@ -99,11 +106,11 @@ function formatResult(result) {
 }
 
 function speedText(result) {
-	return (Number(result.speed) / 1048576).toFixed(2) + ' MiB/s';
+	return (Number(result.speed) / bytesPerMiB).toFixed(2) + ' MiB/s';
 }
 
 return baseclass.extend({
-	render: async function(selectNode, selectedNode) {
+render: async function(validateAddresses, selectNode, selectedNode, configurationBusy) {
 		const lists = new Map();
 		const { node: sourceField, input: source } = select('在线 IP 来源', Object.entries(sources).map(([key, data]) => [key, data[0]]));
 		source.value = 'cn1';
@@ -147,7 +154,10 @@ return baseclass.extend({
 		let firstVisit = true;
 
 		function draftSettings() {
-			return Object.fromEntries(Object.entries(settingsControls).map(([key, control]) => [key, control.value]));
+			return {
+				...Object.fromEntries(Object.entries(settingsControls).map(([key, control]) => [key, control.value])),
+				batchLimit: batchLimit.value.trim()
+			};
 		}
 
 		function setDraftControls(settings) {
@@ -155,16 +165,19 @@ return baseclass.extend({
 				if (Array.from(control.options).some(option => option.value === settings?.[name]))
 					control.value = settings[name];
 			}
+			if (batchBudgetBytes(settings?.batchLimit) !== null)
+				batchLimit.value = settings.batchLimit;
 		}
 
 		function restoreDraft(settings = activeSettings) {
+			batchLimit.value = activeSettings.batchLimit;
 			setDraftControls(settings);
 			setTarget();
 			renderTable();
 		}
 
 		function settingsChanged(draft = draftSettings()) {
-			return Object.keys(settingsControls).some(key => draft[key] !== activeSettings[key]);
+			return Object.keys(activeSettings).some(key => draft[key] !== activeSettings[key]);
 		}
 
 		function applySettings(draft) {
@@ -189,17 +202,25 @@ return baseclass.extend({
 
 		function current() {
 			if (!lists.has(source.value))
-				lists.set(source.value, { nodes: new Map(), selected: new Set() });
+				lists.set(source.value, { nodes: new Map(), selected: new Set(), appSample: '' });
 			return lists.get(source.value);
 		}
 
-		function measurementKey() {
-			const group = activeTarget();
-			return group === 'main' ? 'main:' + activeSettings.file : group;
+		function sampleMiB() {
+			return activeSettings.limit === 'auto' ? defaultLimit() : Number(activeSettings.limit);
+		}
+
+		function measurementKey(group) {
+			const file = group === 'main' ? activeSettings.file : '';
+			return [group, file, activeSettings.timeout, sampleMiB()].join(':');
 		}
 
 		function measurement(row) {
-			return row.measurements[measurementKey()];
+			const group = activeTarget();
+			const result = row.measurements[measurementKey(group)];
+			if (group === 'app' && result?.sample_id && result.sample_id !== current().appSample)
+				return null;
+			return result;
 		}
 
 		function pageRows() {
@@ -227,7 +248,7 @@ return baseclass.extend({
 					}
 					const value = row => {
 						const result = measurement(row);
-						return result && (sort !== 'speed' || result.ok) && result[sort] !== '' &&
+						return result && (sort !== 'speed' || result.rankable) && result[sort] !== '' &&
 							result[sort] != null ? Number(result[sort]) : null;
 					};
 					const first = value(a);
@@ -266,10 +287,11 @@ return baseclass.extend({
 			add.disabled = busy;
 			timeout.disabled = busy;
 			limit.disabled = busy;
+			batchLimit.disabled = busy;
 			file.disabled = busy;
-			test.disabled = busy || current().selected.size === 0;
+			test.disabled = busy || configurationBusy() || current().selected.size === 0;
 			test.hidden = testing;
-			testDefault.disabled = busy;
+			testDefault.disabled = busy || configurationBusy();
 			const fastestResult = bestResult();
 			bestSummary.hidden = !fastestResult || testing;
 			if (fastestResult && !testing) {
@@ -293,14 +315,17 @@ return baseclass.extend({
 			const sampleName = group === 'main' && activeSettings.file !== 'default' ?
 				cn1Files.find(([id]) => id === activeSettings.file)[1] : targets[group][2];
 			settingsSummary.textContent = '测试样本：' + sampleName + ' · 样本大小 ' +
-				(activeSettings.limit === 'auto' ? defaultLimit() : activeSettings.limit) + ' MiB · 超时 ' + activeSettings.timeout + ' 秒';
+				sampleMiB() + ' MiB · 超时 ' + activeSettings.timeout + ' 秒';
+			const budget = batchBudgetBytes(activeSettings.batchLimit);
+			if (budget)
+				settingsSummary.textContent += ' · 整批上限 ' + trafficText(budget);
 		}
 
 		function bestResult() {
 			let bestNode = null;
 			current().nodes.forEach(function(row) {
 				const result = measurement(row);
-				if (result && result.ok && result.ip && (!bestNode || Number(result.speed) > Number(bestNode.speed)))
+				if (result?.rankable && (!bestNode || Number(result.speed) > Number(bestNode.speed)))
 					bestNode = result;
 			});
 			return bestNode;
@@ -319,7 +344,8 @@ return baseclass.extend({
 			const selection = selectedNode(activeTarget());
 			const busy = testing || loading;
 			const headings = [
-				['选择'], ['节点', 'ip', 'location'], ['下载速度', 'speed'], ['TTL', 'ttl'], ['延迟', 'delay'], ['结果'], ['操作']
+				['选择'], ['节点', 'ip', 'location'], ['下载速度', 'speed'], ['TTL', 'ttl'],
+				['ICMP 延迟', 'icmpMs'], ['TCP 建连', 'tcpMs'], ['结果'], ['操作']
 			];
 			const header = headings.map(function([label, key, secondary]) {
 				if (!key)
@@ -353,17 +379,19 @@ return baseclass.extend({
 				const use = button('');
 				updateNodeButton(use, actionIp, selection, '选用', busy);
 				use.addEventListener('click', function() { useNode(actionIp); });
-				const delay = result && result.delay != null ? result.delay + ' ms' : '';
-				const received = result && result.ok && result.exit === 28 ?
-					E('small', { class: 'xb-result-bytes xb-muted' }, ['实收 ' + (Number(result.bytes) / 1048576).toFixed(2) + ' MiB']) : '';
+				const icmpDelay = result?.icmpMs == null ? '' : result.icmpMs + ' ms';
+				const tcpDelay = result?.tcpMs == null ? '' : result.tcpMs + ' ms';
+				const received = result?.ok && (result.exit === 28 || result.capped || result.shortSample) ?
+					E('small', { class: 'xb-result-bytes xb-muted' }, ['实收 ' + (Number(result.bytes) / bytesPerMiB).toFixed(2) + ' MiB']) : '';
 				return [
 					row.ip ? checkbox : '—',
 					E('div', { class: 'xb-node' }, [label, row.location ? E('small', { class: 'xb-muted' }, [row.location]) : '']),
 					E('div', {}, [
 						E('strong', { class: 'xb-rate' }, [result && result.ok ? speedText(result) : '—']),
-						delay ? E('small', { class: 'xb-mobile-delay xb-muted' }, [delay]) : ''
+						icmpDelay ? E('small', { class: 'xb-mobile-delay xb-muted' }, ['ICMP ' + icmpDelay]) : '',
+						tcpDelay ? E('small', { class: 'xb-mobile-delay xb-muted' }, ['TCP ' + tcpDelay]) : ''
 					]),
-					result && result.ttl ? result.ttl : '—', delay || '—',
+					result && result.ttl ? result.ttl : '—', icmpDelay || '—', tcpDelay || '—',
 					E('div', { class: result ? '' : 'xb-muted' }, [formatResult(result), received]),
 					actionIp ? use : '—'
 				];
@@ -402,7 +430,7 @@ return baseclass.extend({
 				const imported = new Set();
 				response.nodes.split('\n').forEach(function(line) {
 					const [ip, location] = line.split('\t');
-					if (nodeAddress(ip)) {
+					if (ip) {
 						addNode(entry.nodes, ip, location || '');
 						imported.add(ip);
 					}
@@ -425,33 +453,39 @@ return baseclass.extend({
 		}
 
 		async function run(ips) {
-			if (testing || loading || !ips.length)
+			if (testing || loading || configurationBusy() || !ips.length)
 				return;
 			const entry = current();
 			const group = activeTarget();
 			const testFile = group === 'main' ? activeSettings.file : '';
-			const key = measurementKey();
+			const key = measurementKey(group);
 			const seconds = Number(activeSettings.timeout);
-			const megabytes = activeSettings.limit === 'auto' ? defaultLimit() : Number(activeSettings.limit);
+			const megabytes = sampleMiB();
+			const sampleBytes = megabytes * bytesPerMiB;
+			const minimumBytes = Math.min(sampleBytes / 4, bytesPerMiB);
+			const budget = batchBudgetBytes(activeSettings.batchLimit);
 			testing = true;
 			cancelled = false;
 			renderTable();
 			let done = 0;
 			let serverBusy = false;
 			let pingOnly = false;
+			let downloaded = 0;
+			let budgetStop = '';
 			try {
 				const batches = Math.ceil(ips.length / pageSize);
-				for (let start = 0; start < ips.length && !cancelled && !serverBusy; start += pageSize) {
+				for (let start = 0; start < ips.length && !cancelled && !serverBusy && !budgetStop; start += pageSize) {
 					const batch = batches > 1 ? ' · 第 ' + (start / pageSize + 1) + '/' + batches + ' 批' : '';
 					for (const ip of ips.slice(start, start + pageSize)) {
-						if (cancelled)
+						if (cancelled || budgetStop)
 							break;
 						const activity = pingOnly ? '微软商店样本暂不可用，本批仅测延迟 · ' : '';
 						progress.textContent = activity + '正在测 ' + (ip || '默认节点') +
 							'（' + (done + 1) + '/' + ips.length + '）' + batch;
 						let result;
+						const maxBytes = budget ? Math.min(sampleBytes, budget - downloaded) : undefined;
 						try {
-							result = await probe(group, ip, seconds, megabytes, sources[source.value][2], testFile, Number(pingOnly));
+							result = await probe(group, ip, seconds, megabytes, sources[source.value][2], testFile, Number(pingOnly), maxBytes);
 						} catch (error) {
 							result = { error: 'request' };
 						}
@@ -460,11 +494,32 @@ return baseclass.extend({
 							break;
 						}
 						pingOnly = pingOnly || (group === 'app' && result.error === 'sample');
-						const bytes = Number(result.bytes);
+						const bytes = result.bytes == null || result.bytes === '' ? NaN : Number(result.bytes);
+						if (budget) {
+							if (!Number.isSafeInteger(bytes) || bytes < 0) {
+								budgetStop = '无法确认本轮流量，已停止测速';
+							} else {
+								downloaded += bytes;
+								if (downloaded >= budget && done + 1 < ips.length)
+									budgetStop = '已达到整批流量上限';
+							}
+						}
 						const validResponse = result.code === '200' || result.code === '206';
-						result.ok = validResponse && bytes > 0 && (result.exit === 0 || result.exit === 28);
-						result.delay = result.rtt ? Number(result.rtt) : Number(result.connect) > 0 ?
-							Math.round(Number(result.connect) * 1000) : null;
+						const rate = Number(result.speed);
+						result.ok = !result.error && validResponse && bytes > 0 && Number.isFinite(rate) &&
+							(result.exit === 0 || result.exit === 28);
+						result.capped = maxBytes != null && maxBytes < sampleBytes;
+						result.shortSample = bytes < minimumBytes;
+						result.rankable = result.ok && !!result.ip && rate > 0 && !result.shortSample && !result.capped &&
+							(group !== 'app' || !!result.sample_id);
+						const rtt = result.rtt ? Number(result.rtt) : NaN;
+						result.icmpMs = Number.isFinite(rtt) && rtt >= 0 ? rtt : null;
+						const connect = Number(result.connect);
+						const lookup = Number(result.namelookup);
+						result.tcpMs = Number.isFinite(connect) && connect > 0 && lookup >= 0 && connect >= lookup ?
+							Math.round((connect - lookup) * 1000000) / 1000 : null;
+						if (group === 'app' && result.sample_id)
+							entry.appSample = result.sample_id;
 						addNode(entry.nodes, ip, ip ? '' : '默认解析');
 						entry.nodes.get(ip).measurements[key] = result;
 						done++;
@@ -472,7 +527,8 @@ return baseclass.extend({
 					}
 				}
 				progress.textContent = serverBusy ? '路由器正在执行另一项测速，请稍后重试。' :
-					(cancelled ? '已停止' : '测速完成') + ' · ' + done + '/' + ips.length +
+					(cancelled ? '已停止' : budgetStop || '测速完成') + ' · ' + done + '/' + ips.length +
+					(budget ? ' · 已确认下载 ' + trafficText(downloaded) + ' / ' + trafficText(budget) : '') +
 					(pingOnly ? ' · 微软商店样本暂不可用，本批仅测延迟。再次开始将重新取样。' : '');
 				if (!sort) {
 					sort = 'speed';
@@ -527,30 +583,55 @@ return baseclass.extend({
 			renderTable();
 		});
 		clear.addEventListener('click', function() { current().selected.clear(); renderTable(); });
-		add.addEventListener('click', function() {
-			const ips = Array.from(new Set(manual.value.trim().split(/[\s,，]+/).filter(Boolean)));
-			if (!ips.length || ips.length > pageSize || !ips.every(nodeAddress)) {
+		add.addEventListener('click', async function() {
+			if (loading || testing)
+				return;
+			const input = manual.value;
+			const ips = Array.from(new Set(input.trim().toLowerCase().split(/[\s,，]+/).filter(Boolean)));
+			if (!ips.length || ips.length > pageSize || ips.some(ip => ip.length > 39)) {
 				progress.textContent = '请粘贴 1–' + pageSize + ' 个有效的 IPv4 或 IPv6 地址。';
 				return;
 			}
+			if (['main', 'legacy'].includes(activeTarget()) && ips.some(ip => ip.includes(':'))) {
+				progress.textContent = 'Xbox cn1、cn2 测速仅使用公网 IPv4 节点。';
+				return;
+			}
 			const entry = current();
-			ips.forEach(function(ip) {
-				addNode(entry.nodes, ip, '');
-				entry.nodes.get(ip).manual = true;
-				entry.selected.add(ip);
-			});
-			progress.textContent = '已勾选手动添加的 ' + ips.length + ' 个节点。';
-			manual.value = '';
-			resetPage();
+			loading = true;
+			renderTable();
+			try {
+				const response = await validateAddresses('nodes', ips.join('\n'));
+				if (response?.error === 'cdn') {
+					progress.textContent = '请检查列表，所有节点都必须是有效的公网 CDN IP。';
+					return;
+				}
+				if (response?.error !== '')
+					throw new Error('Address validation failed');
+				for (const ip of ips) {
+					addNode(entry.nodes, ip, '');
+					entry.nodes.get(ip).manual = true;
+					entry.selected.add(ip);
+				}
+				progress.textContent = '已勾选手动添加的 ' + ips.length + ' 个节点。';
+				if (manual.value === input) manual.value = '';
+				resetPage();
+			} catch (error) {
+				progress.textContent = '暂时无法校验节点 IP，请重试。';
+			} finally {
+				loading = false;
+				renderTable();
+			}
 		});
 		test.addEventListener('click', function() { run(Array.from(current().selected)); });
 		testDefault.addEventListener('click', function() { run(['']); });
 		best.addEventListener('click', function() { useNode(bestResult()?.ip); });
-		stop.addEventListener('click', function() {
+		function stopTest() {
+			if (!testing || cancelled) return;
 			cancelled = true;
 			stop.disabled = true;
 			progress.textContent = '当前节点结束后停止。';
-		});
+		}
+		stop.addEventListener('click', stopTest);
 
 		const nodes = E('div', {}, [
 			E('div', { class: 'xb-speed-controls' }, [
@@ -578,18 +659,24 @@ return baseclass.extend({
 			for (const [value, text] of choices) field.value(value, text);
 			return field;
 		}
-		const targetOption = preference('target', '测速目标', Object.entries(targets).map(([key, data]) => [key, data[0]]));
+		const targetOption = preference('target', '测速目标', Object.entries(targets)
+			.filter(([key]) => key !== 'main' && key !== 'legacy').map(([key, data]) => [key, data[0]]));
 		targetOption.default = 'global';
 		const fileOption = preference('file', '测速文件', cn1Files);
 		section.taboption('speed-settings', form.DummyValue, 'fixed_file', '测速文件').renderWidget = () => sample;
 		const limitOption = preference('limit', '样本大小', [['auto', '原版样本'], ['1', '样本 1 MiB'], ['8', '样本 8 MiB'], ['32', '样本 32 MiB']]);
 		const timeoutOption = preference('timeout', '单节点超时', [['3', '超时 3 秒'], ['5', '超时 5 秒'], ['10', '超时 10 秒']]);
+		const budgetOption = section.taboption('speed-settings', form.Value, 'batch_limit', '整批流量上限（GB）',
+			'按每次测速的样本下载量计算。填 0 表示不限，可填写小数。');
+		budgetOption.default = '0';
 		const settingsForm = await map.render();
 		const control = option => option.getUIElement('speed').node.querySelector('select');
 		const target = control(targetOption);
 		const file = control(fileOption);
 		const limit = control(limitOption);
 		const timeout = control(timeoutOption);
+		const batchLimit = budgetOption.getUIElement('speed').node.querySelector('input');
+		batchLimit.inputMode = 'decimal';
 		const targetField = target.closest('.cbi-value');
 		const fileField = file.closest('.cbi-value');
 		const fixedFile = sample.closest('.cbi-value');
@@ -611,6 +698,10 @@ return baseclass.extend({
 		});
 		setTarget();
 		renderTable();
-		return { element: settingsForm, refresh: renderTable, draftSettings, restoreDraft, settingsChanged, applySettings };
+		return {
+			element: settingsForm, refresh: renderTable, draftSettings, restoreDraft, settingsChanged, applySettings,
+			isTesting: () => testing, stopTest,
+			validSettings: draft => batchBudgetBytes(draft.batchLimit) !== null
+		};
 	}
 });

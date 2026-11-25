@@ -2,14 +2,25 @@
 set -eu
 
 # Use the host apk binary from the OpenWrt 25.12 SDK.
-apk_tool=${1:?Usage: sh package/build.sh /path/to/host/bin/apk}
+apk_tool=${1:?Usage: sh package/build.sh /path/to/host/bin/apk [version[-rN]]}
 if [ "$(id -ru)" -ne 0 ]; then
 	echo 'Run the build as root in a Linux build environment. The OpenWrt host tool may ignore fakeroot.' >&2
 	exit 1
 fi
 project=$(CDPATH='' cd -- "$(dirname -- "$0")/.." && pwd)
 name=luci-app-xboxdownload-openwrt
-version=1.0.1-r2
+default_version=$(cat "$project/package/VERSION")
+version=${2:-$default_version}
+case "$version" in
+	*-r*) ;;
+	"${default_version%-r*}") version=$default_version ;;
+	*) version="$version-r0" ;;
+esac
+case "$version" in *[!0-9.r-]*) version= ;; esac
+if ! printf '%s\n' "$version" | LC_ALL=C grep -Eq '^(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)-r(0|[1-9][0-9]*)$'; then
+	echo 'APK version must use X.Y.Z or X.Y.Z-rN.' >&2
+	exit 1
+fi
 stage=$(mktemp -d)
 trap 'rm -rf "$stage"' EXIT
 
